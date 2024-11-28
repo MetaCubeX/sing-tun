@@ -192,7 +192,7 @@ func init() {
 func open(name string, vnetHdr bool) (int, error) {
 	fd, err := unix.Open(controlPath, unix.O_RDWR, 0)
 	if err != nil {
-		return -1, err
+		return -1, E.Cause(err, "open:", controlPath)
 	}
 
 	var ifr struct {
@@ -209,12 +209,12 @@ func open(name string, vnetHdr bool) (int, error) {
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.TUNSETIFF, uintptr(unsafe.Pointer(&ifr)))
 	if errno != 0 {
 		unix.Close(fd)
-		return -1, errno
+		return -1, E.Cause(errno, "ioctl")
 	}
 
 	if err = unix.SetNonblock(fd, true); err != nil {
 		unix.Close(fd)
-		return -1, err
+		return -1, E.Cause(err, "set nonblock")
 	}
 
 	return fd, nil
@@ -232,18 +232,18 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	if len(t.options.Inet4Address) > 0 {
 		for _, address := range t.options.Inet4Address {
 			addr4, _ := netlink.ParseAddr(address.String())
-			err = netlink.AddrAdd(tunLink, addr4)
+			err = netlink.AddrReplace(tunLink, addr4)
 			if err != nil {
-				return err
+				return E.Cause(err, "add inet4 addr:", address.String())
 			}
 		}
 	}
 	if len(t.options.Inet6Address) > 0 {
 		for _, address := range t.options.Inet6Address {
 			addr6, _ := netlink.ParseAddr(address.String())
-			err = netlink.AddrAdd(tunLink, addr6)
+			err = netlink.AddrReplace(tunLink, addr6)
 			if err != nil {
-				return err
+				return E.Cause(err, "add inet6 addr:", address.String())
 			}
 		}
 	}
@@ -290,7 +290,7 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 
 	err = netlink.LinkSetUp(tunLink)
 	if err != nil {
-		return err
+		return E.Cause(err, "link setup")
 	}
 
 	if t.options.IPRoute2TableIndex == 0 {
@@ -306,7 +306,7 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	err = t.setRoute(tunLink)
 	if err != nil {
 		_ = t.unsetRoute0(tunLink)
-		return err
+		return E.Cause(err, "set route")
 	}
 
 	err = t.unsetRules()
@@ -316,7 +316,7 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	err = t.setRules()
 	if err != nil {
 		_ = t.unsetRules()
-		return err
+		return E.Cause(err, "set rules")
 	}
 
 	t.setSearchDomainForSystemdResolved()
