@@ -576,10 +576,8 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		const protectedFromVPN = 0x20000
 		if p4 {
 			it = netlink.NewRule()
-			if t.options.InterfaceMonitor.OverrideAndroidVPN() {
-				it.Mark = protectedFromVPN
-				it.MarkSet = true
-			}
+			it.Mark = protectedFromVPN
+			it.MarkSet = true
 			it.Mask = protectedFromVPN
 			it.Priority = priority
 			it.Family = unix.AF_INET
@@ -589,10 +587,8 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		}
 		if p6 {
 			it = netlink.NewRule()
-			if t.options.InterfaceMonitor.OverrideAndroidVPN() {
-				it.Mark = protectedFromVPN
-				it.MarkSet = true
-			}
+			it.Mark = protectedFromVPN
+			it.MarkSet = true
 			it.Mask = protectedFromVPN
 			it.Family = unix.AF_INET6
 			it.Priority = priority6
