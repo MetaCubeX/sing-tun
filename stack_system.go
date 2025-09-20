@@ -713,7 +713,7 @@ func (s *System) rejectIPv4WithICMP(ipHdr header.IPv4, code header.ICMPv4Code) e
 	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr[:header.ICMPv4MinimumSize], checksum.Checksum(ipHdr.Payload(), 0)))
 	copy(icmpHdr.Payload(), payload)
 	if PacketOffset > 0 {
-		newPacket.ExtendHeader(PacketOffset)[3] = syscall.AF_INET
+		PacketFillHeader(newPacket.ExtendHeader(PacketOffset), header.IPv4Version)
 	} else {
 		newPacket.Advance(-s.frontHeadroom)
 	}
