@@ -1,29 +1,47 @@
 package tun
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/netip"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
-	E "github.com/sagernet/sing/common/exceptions"
-	F "github.com/sagernet/sing/common/format"
-	"github.com/sagernet/sing/common/logger"
-	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/ranges"
+	"github.com/metacubex/sing/common/buf"
+	E "github.com/metacubex/sing/common/exceptions"
+	F "github.com/metacubex/sing/common/format"
+	"github.com/metacubex/sing/common/logger"
+	M "github.com/metacubex/sing/common/metadata"
+	N "github.com/metacubex/sing/common/network"
+	"github.com/metacubex/sing/common/ranges"
 )
 
 type Handler interface {
+	PrepareConnection(
+		network string,
+		source M.Socksaddr,
+		destination M.Socksaddr,
+		routeContext DirectRouteContext,
+		timeout time.Duration,
+	) (DirectRouteDestination, error)
 	N.TCPConnectionHandler
-	N.UDPConnectionHandler
+	PacketHandler
 	E.Handler
+}
+
+type DirectRouteContext interface {
+	WritePacket(packet []byte) error
+}
+
+type PacketHandler interface {
+	NewPacket(ctx context.Context, key netip.AddrPort, buffer *buf.Buffer, metadata M.Metadata, init func(natConn N.PacketConn) N.PacketWriter)
 }
 
 type Tun interface {
 	io.ReadWriter
-	N.VectorisedWriter
 	Close() error
 }
 
@@ -39,6 +57,12 @@ type LinuxTUN interface {
 	BatchRead(buffers [][]byte, offset int, readN []int) (n int, err error)
 	BatchWrite(buffers [][]byte, offset int) error
 	TXChecksumOffload() bool
+}
+
+type DarwinTUN interface {
+	Tun
+	BatchRead() ([]*buf.Buffer, error)
+	BatchWrite(buffers []*buf.Buffer) error
 }
 
 const (
@@ -61,6 +85,8 @@ type Options struct {
 	AutoRedirectMarkMode     bool
 	AutoRedirectInputMark    uint32
 	AutoRedirectOutputMark   uint32
+	Inet4LoopbackAddress     []netip.Addr
+	Inet6LoopbackAddress     []netip.Addr
 	StrictRoute              bool
 	Inet4RouteAddress        []netip.Prefix
 	Inet6RouteAddress        []netip.Prefix
@@ -70,6 +96,8 @@ type Options struct {
 	ExcludeInterface         []string
 	IncludeUID               []ranges.Range[uint32]
 	ExcludeUID               []ranges.Range[uint32]
+	ExcludeSrcPort           []ranges.Range[uint16]
+	ExcludeDstPort           []ranges.Range[uint16]
 	IncludeAndroidUser       []int
 	IncludePackage           []string
 	ExcludePackage           []string
@@ -82,6 +110,10 @@ type Options struct {
 
 	// For library usages.
 	EXP_DisableDNSHijack bool
+
+	// For darwin tun
+	EXP_RecvMsgX bool
+	EXP_SendMsgX bool
 }
 
 func (o *Options) Inet4GatewayAddr() netip.Addr {

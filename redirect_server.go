@@ -7,13 +7,13 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/sing/common/atomic"
-	"github.com/sagernet/sing/common/control"
-	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/logger"
-	M "github.com/sagernet/sing/common/metadata"
+	"github.com/metacubex/sing/common/control"
+	E "github.com/metacubex/sing/common/exceptions"
+	"github.com/metacubex/sing/common/logger"
+	M "github.com/metacubex/sing/common/metadata"
 )
 
 const ProtocolRedirect = "redirect"

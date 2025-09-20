@@ -11,8 +11,12 @@ import (
 
 var _ GVisorTun = (*NativeTun)(nil)
 
-func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, error) {
-	return &WintunEndpoint{tun: t}, nil
+func (t *NativeTun) WritePacket(pkt *stack.PacketBuffer) (int, error) {
+	return t.write(pkt.AsSlices())
+}
+
+func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error) {
+	return &WintunEndpoint{tun: t}, stack.NICOptions{}, nil
 }
 
 var _ stack.LinkEndpoint = (*WintunEndpoint)(nil)

@@ -3,26 +3,70 @@
 package tun
 
 import (
+	"github.com/metacubex/gvisor/pkg/rawfile"
 	"github.com/metacubex/gvisor/pkg/tcpip/link/fdbased"
 	"github.com/metacubex/gvisor/pkg/tcpip/stack"
+
+	"golang.org/x/sys/unix"
 )
+
+func init() {
+	fdbased.BufConfig = []int{65535}
+}
 
 var _ GVisorTun = (*NativeTun)(nil)
 
-func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, error) {
+func (t *NativeTun) WritePacket(pkt *stack.PacketBuffer) (int, error) {
+	views := pkt.AsSlices()
+	numIovecs := len(views)
+
+	// Allocate small iovec arrays on the stack.
+	var iovecsArr [8]unix.Iovec
+	iovecs := iovecsArr[:0]
+	if numIovecs > len(iovecsArr) {
+		iovecs = make([]unix.Iovec, 0, numIovecs)
+	}
+
+	var dataLen int
+	for _, packetSlice := range views {
+		dataLen += len(packetSlice)
+		iovec := unix.Iovec{
+			Base: &packetSlice[0],
+		}
+		iovec.SetLen(len(packetSlice))
+		iovecs = append(iovecs, iovec)
+	}
+	errno := rawfile.NonBlockingWriteIovec(t.tunFd, iovecs)
+	if errno == 0 {
+		return dataLen, nil
+	} else {
+		return 0, errno
+	}
+}
+
+func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error) {
 	if t.gsoEnabled {
-		return fdbased.New(&fdbased.Options{
+		ep, err := fdbased.New(&fdbased.Options{
 			FDs:               []int{t.tunFd},
 			MTU:               t.options.MTU,
 			GSOMaxSize:        gsoMaxSize,
 			RXChecksumOffload: true,
 			TXChecksumOffload: t.txChecksumOffload,
 		})
+		if err != nil {
+			return nil, stack.NICOptions{}, err
+		}
+		return ep, stack.NICOptions{}, nil
+	} else {
+		ep, err := fdbased.New(&fdbased.Options{
+			FDs:               []int{t.tunFd},
+			MTU:               t.options.MTU,
+			RXChecksumOffload: true,
+			TXChecksumOffload: t.txChecksumOffload,
+		})
+		if err != nil {
+			return nil, stack.NICOptions{}, err
+		}
+		return ep, stack.NICOptions{}, nil
 	}
-	return fdbased.New(&fdbased.Options{
-		FDs:               []int{t.tunFd},
-		MTU:               t.options.MTU,
-		RXChecksumOffload: true,
-		TXChecksumOffload: t.txChecksumOffload,
-	})
 }

@@ -5,11 +5,11 @@ package tun
 import (
 	"net/netip"
 
-	"github.com/metacubex/sing-tun/control"
-	"github.com/sagernet/nftables"
-	"github.com/sagernet/nftables/binaryutil"
-	"github.com/sagernet/nftables/expr"
-	"github.com/sagernet/sing/common"
+	"github.com/metacubex/nftables"
+	"github.com/metacubex/nftables/binaryutil"
+	"github.com/metacubex/nftables/expr"
+	"github.com/metacubex/sing/common"
+	"github.com/metacubex/sing/common/control"
 
 	"golang.org/x/exp/slices"
 	"golang.org/x/sys/unix"
@@ -32,12 +32,21 @@ func (r *autoRedirect) setupNFTables() error {
 		return err
 	}
 
+	err = r.interfaceFinder.Update()
+	if err != nil {
+		return err
+	}
 	r.localAddresses = common.FlatMap(r.interfaceFinder.Interfaces(), func(it control.Interface) []netip.Prefix {
 		return common.Filter(it.Addresses, func(prefix netip.Prefix) bool {
 			return it.Name == "lo" || prefix.Addr().IsGlobalUnicast()
 		})
 	})
 	err = r.nftablesCreateLocalAddressSets(nft, table, r.localAddresses, nil)
+	if err != nil {
+		return err
+	}
+
+	err = r.nftablesCreateLoopbackAddressSets(nft, table)
 	if err != nil {
 		return err
 	}
@@ -57,10 +66,25 @@ func (r *autoRedirect) setupNFTables() error {
 				return err
 			}
 			r.nftablesCreateUnreachable(nft, table, chainOutput)
-			r.nftablesCreateRedirect(nft, table, chainOutput)
-
+			err = r.nftablesCreateRedirect(nft, table, chainOutput)
+			if err != nil {
+				return err
+			}
+			if len(r.tunOptions.Inet4LoopbackAddress) > 0 || len(r.tunOptions.Inet6LoopbackAddress) > 0 {
+				chainOutputRoute := nft.AddChain(&nftables.Chain{
+					Name:     "output_route",
+					Table:    table,
+					Hooknum:  nftables.ChainHookOutput,
+					Priority: nftables.ChainPriorityMangle,
+					Type:     nftables.ChainTypeRoute,
+				})
+				err = r.nftablesCreateLoopbackReroute(nft, table, chainOutputRoute)
+				if err != nil {
+					return err
+				}
+			}
 			chainOutputUDP := nft.AddChain(&nftables.Chain{
-				Name:     "output_udp",
+				Name:     "output_udp_icmp",
 				Table:    table,
 				Hooknum:  nftables.ChainHookOutput,
 				Priority: nftables.ChainPriorityMangle,
@@ -73,7 +97,7 @@ func (r *autoRedirect) setupNFTables() error {
 			r.nftablesCreateUnreachable(nft, table, chainOutputUDP)
 			r.nftablesCreateMark(nft, table, chainOutputUDP)
 		} else {
-			r.nftablesCreateRedirect(nft, table, chainOutput, &expr.Meta{
+			err = r.nftablesCreateRedirect(nft, table, chainOutput, &expr.Meta{
 				Key:      expr.MetaKeyOIFNAME,
 				Register: 1,
 			}, &expr.Cmp{
@@ -81,6 +105,9 @@ func (r *autoRedirect) setupNFTables() error {
 				Register: 1,
 				Data:     nftablesIfname(r.tunOptions.Name),
 			})
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -96,22 +123,45 @@ func (r *autoRedirect) setupNFTables() error {
 		return err
 	}
 	r.nftablesCreateUnreachable(nft, table, chainPreRouting)
-	r.nftablesCreateRedirect(nft, table, chainPreRouting)
-	r.nftablesCreateMark(nft, table, chainPreRouting)
-
+	err = r.nftablesCreateRedirect(nft, table, chainPreRouting)
+	if err != nil {
+		return err
+	}
 	if r.tunOptions.AutoRedirectMarkMode {
+		r.nftablesCreateMark(nft, table, chainPreRouting)
+		if len(r.tunOptions.Inet4LoopbackAddress) > 0 || len(r.tunOptions.Inet6LoopbackAddress) > 0 {
+			chainPreRoutingFilter := nft.AddChain(&nftables.Chain{
+				Name:     "prerouting_filter",
+				Table:    table,
+				Hooknum:  nftables.ChainHookPrerouting,
+				Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 1),
+				Type:     nftables.ChainTypeFilter,
+			})
+			err = r.nftablesCreateLoopbackReroute(nft, table, chainPreRoutingFilter)
+			if err != nil {
+				return err
+			}
+		}
 		chainPreRoutingUDP := nft.AddChain(&nftables.Chain{
-			Name:     "prerouting_udp",
+			Name:     "prerouting_udp_icmp",
 			Table:    table,
 			Hooknum:  nftables.ChainHookPrerouting,
 			Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 2),
 			Type:     nftables.ChainTypeFilter,
 		})
-		if r.enableIPv4 {
-			nftablesCreateExcludeDestinationIPSet(nft, table, chainPreRoutingUDP, 5, "inet4_local_address_set", nftables.TableFamilyIPv4, false)
+		ipProto := &nftables.Set{
+			Table:     table,
+			Anonymous: true,
+			Constant:  true,
+			KeyType:   nftables.TypeInetProto,
 		}
-		if r.enableIPv6 {
-			nftablesCreateExcludeDestinationIPSet(nft, table, chainPreRoutingUDP, 6, "inet6_local_address_set", nftables.TableFamilyIPv6, false)
+		err = nft.AddSet(ipProto, []nftables.SetElement{
+			{Key: []byte{unix.IPPROTO_UDP}},
+			{Key: []byte{unix.IPPROTO_ICMP}},
+			{Key: []byte{unix.IPPROTO_ICMPV6}},
+		})
+		if err != nil {
+			return err
 		}
 		nft.AddRule(&nftables.Rule{
 			Table: table,
@@ -121,10 +171,29 @@ func (r *autoRedirect) setupNFTables() error {
 					Key:      expr.MetaKeyL4PROTO,
 					Register: 1,
 				},
-				&expr.Cmp{
-					Op:       expr.CmpOpEq,
+				&expr.Lookup{
+					SourceRegister: 1,
+					SetID:          ipProto.ID,
+					SetName:        ipProto.Name,
+					Invert:         true,
+				},
+				&expr.Verdict{
+					Kind: expr.VerdictReturn,
+				},
+			},
+		})
+		nft.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: chainPreRoutingUDP,
+			Exprs: []expr.Any{
+				&expr.Meta{
+					Key:      expr.MetaKeyIIFNAME,
 					Register: 1,
-					Data:     []byte{unix.IPPROTO_UDP},
+				},
+				&expr.Cmp{
+					Op:       expr.CmpOpNeq,
+					Register: 1,
+					Data:     nftablesIfname(r.tunOptions.Name),
 				},
 				&expr.Ct{
 					Key:      expr.CtKeyMARK,
@@ -137,6 +206,40 @@ func (r *autoRedirect) setupNFTables() error {
 				},
 				&expr.Meta{
 					Key:            expr.MetaKeyMARK,
+					Register:       1,
+					SourceRegister: true,
+				},
+				&expr.Counter{},
+			},
+		})
+		nft.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: chainPreRoutingUDP,
+			Exprs: []expr.Any{
+				&expr.Ct{
+					Key:      expr.CtKeyMARK,
+					Register: 1,
+				},
+				&expr.Cmp{
+					Op:       expr.CmpOpNeq,
+					Register: 1,
+					Data:     binaryutil.NativeEndian.PutUint32(r.tunOptions.AutoRedirectInputMark),
+				},
+				&expr.Immediate{
+					Register: 1,
+					Data:     binaryutil.NativeEndian.PutUint32(r.tunOptions.AutoRedirectOutputMark),
+				},
+				&expr.Meta{
+					Key:            expr.MetaKeyMARK,
+					Register:       1,
+					SourceRegister: true,
+				},
+				&expr.Meta{
+					Key:      expr.MetaKeyMARK,
+					Register: 1,
+				},
+				&expr.Ct{
+					Key:            expr.CtKeyMARK,
 					Register:       1,
 					SourceRegister: true,
 				},
@@ -220,7 +323,7 @@ func (r *autoRedirect) cleanupNFTables() {
 		Name:   r.tableName,
 		Family: nftables.TableFamilyINet,
 	})
-	common.Must(r.configureOpenWRTFirewall4(nft, true))
+	_ = r.configureOpenWRTFirewall4(nft, true)
 	_ = nft.Flush()
 	_ = nft.CloseLasting()
 }

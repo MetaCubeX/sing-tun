@@ -86,17 +86,25 @@ type Network interface {
 	// SourceAddress returns the value of the "source address" field.
 	SourceAddress() tcpip.Address
 
+	SourceAddr() netip.Addr
+
+	SourceAddressSlice() []byte
+
 	// DestinationAddress returns the value of the "destination address"
 	// field.
 	DestinationAddress() tcpip.Address
 
 	DestinationAddr() netip.Addr
 
+	DestinationAddressSlice() []byte
+
 	// Checksum returns the value of the "checksum" field.
 	Checksum() uint16
 
 	// SetSourceAddress sets the value of the "source address" field.
 	SetSourceAddress(tcpip.Address)
+
+	SetSourceAddr(netip.Addr)
 
 	// SetDestinationAddress sets the value of the "destination address"
 	// field.

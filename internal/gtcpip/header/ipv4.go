@@ -22,7 +22,7 @@ import (
 
 	"github.com/metacubex/sing-tun/internal/gtcpip"
 	"github.com/metacubex/sing-tun/internal/gtcpip/checksum"
-	"github.com/sagernet/sing/common"
+	"github.com/metacubex/sing/common"
 )
 
 // RFC 971 defines the fields of the IPv4 header on page 11 using the following
@@ -315,6 +315,10 @@ func (b IPv4) Flags() uint8 {
 	return uint8(binary.BigEndian.Uint16(b[flagsFO:]) >> 13)
 }
 
+func (b IPv4) FlagsDarwinRaw() uint8 {
+	return uint8(binary.BigEndian.Uint16(b[flagsFO:]) >> 13)
+}
+
 // More returns whether the more fragments flag is set.
 func (b IPv4) More() bool {
 	return b.Flags()&IPv4FlagMoreFragments != 0
@@ -330,9 +334,17 @@ func (b IPv4) FragmentOffset() uint16 {
 	return binary.BigEndian.Uint16(b[flagsFO:]) << 3
 }
 
+func (b IPv4) FragmentOffsetDarwinRaw() uint16 {
+	return common.NativeEndian.Uint16(b[flagsFO:]) << 3
+}
+
 // TotalLength returns the "total length" field of the IPv4 header.
 func (b IPv4) TotalLength() uint16 {
 	return binary.BigEndian.Uint16(b[IPv4TotalLenOffset:])
+}
+
+func (b IPv4) TotalLengthDarwinRaw() uint16 {
+	return common.NativeEndian.Uint16(b[IPv4TotalLenOffset:]) + uint16(b.HeaderLength())
 }
 
 // Checksum returns the checksum field of the IPv4 header.
@@ -428,6 +440,10 @@ func (b IPv4) SetTotalLength(totalLength uint16) {
 	binary.BigEndian.PutUint16(b[IPv4TotalLenOffset:], totalLength)
 }
 
+func (b IPv4) SetTotalLengthDarwinRaw(totalLength uint16) {
+	common.NativeEndian.PutUint16(b[IPv4TotalLenOffset:], totalLength)
+}
+
 // SetChecksum sets the checksum field of the IPv4 header.
 func (b IPv4) SetChecksum(v uint16) {
 	checksum.Put(b[xsum:], v)
@@ -438,6 +454,11 @@ func (b IPv4) SetChecksum(v uint16) {
 func (b IPv4) SetFlagsFragmentOffset(flags uint8, offset uint16) {
 	v := (uint16(flags) << 13) | (offset >> 3)
 	binary.BigEndian.PutUint16(b[flagsFO:], v)
+}
+
+func (b IPv4) SetFlagsFragmentOffsetDarwinRaw(flags uint8, offset uint16) {
+	v := (uint16(flags) << 13) | (offset >> 3)
+	common.NativeEndian.PutUint16(b[flagsFO:], v)
 }
 
 // SetID sets the identification field.
@@ -458,7 +479,10 @@ func (b IPv4) SetDestinationAddress(addr tcpip.Address) {
 
 // CalculateChecksum calculates the checksum of the IPv4 header.
 func (b IPv4) CalculateChecksum() uint16 {
-	return checksum.Checksum(b[:b.HeaderLength()], 0)
+	// return checksum.Checksum(b[:b.HeaderLength()], 0)
+	xsum0 := checksum.Checksum(b[:xsum], 0)
+	xsum0 = checksum.Checksum(b[xsum+2:b.HeaderLength()], xsum0)
+	return xsum0
 }
 
 // Encode encodes all the fields of the IPv4 header.
@@ -550,7 +574,8 @@ func (b IPv4) IsChecksumValid() bool {
 	//        same set of octets, including the checksum field.  If the result
 	//        is all 1 bits (-0 in 1's complement arithmetic), the check
 	//        succeeds.
-	return b.CalculateChecksum() == 0xffff
+	//return b.CalculateChecksum() == 0xffff
+	return checksum.Checksum(b[:b.HeaderLength()], 0) == 0xffff
 }
 
 // IsV4MulticastAddress determines if the provided address is an IPv4 multicast

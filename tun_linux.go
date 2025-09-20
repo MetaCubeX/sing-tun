@@ -8,19 +8,15 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
-	"syscall"
 	"unsafe"
 
-	"github.com/metacubex/sing-tun/control"
+	"github.com/metacubex/sing/common"
+	"github.com/metacubex/sing/common/control"
+	E "github.com/metacubex/sing/common/exceptions"
+	"github.com/metacubex/sing/common/rw"
+	"github.com/metacubex/sing/common/shell"
+	"github.com/metacubex/sing/common/x/list"
 	"github.com/sagernet/netlink"
-	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
-	E "github.com/sagernet/sing/common/exceptions"
-	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/rw"
-	"github.com/sagernet/sing/common/shell"
-	"github.com/sagernet/sing/common/x/list"
 
 	"golang.org/x/sys/unix"
 )
@@ -30,7 +26,6 @@ var _ LinuxTUN = (*NativeTun)(nil)
 type NativeTun struct {
 	tunFd             int
 	tunFile           *os.File
-	tunWriter         N.VectorisedWriter
 	interfaceCallback *list.Element[DefaultInterfaceUpdateCallback]
 	options           Options
 	ruleIndex6        []int
@@ -70,11 +65,6 @@ func New(options Options) (Tun, error) {
 			tunFile: os.NewFile(uintptr(options.FileDescriptor), "tun"),
 			options: options,
 		}
-	}
-	var ok bool
-	nativeTun.tunWriter, ok = bufio.CreateVectorisedWriter(nativeTun.tunFile)
-	if !ok {
-		panic("create vectorised writer")
 	}
 	return nativeTun, nil
 }
@@ -117,20 +107,6 @@ func (t *NativeTun) Write(p []byte) (n int, err error) {
 		return
 	}
 	return t.tunFile.Write(p)
-}
-
-func (t *NativeTun) WriteVectorised(buffers []*buf.Buffer) error {
-	if t.gsoEnabled {
-		n := buf.LenMulti(buffers)
-		buffer := buf.NewSize(virtioNetHdrLen + n)
-		buffer.Truncate(virtioNetHdrLen)
-		buf.CopyMulti(buffer.Extend(n), buffers)
-		_, err := t.tunFile.Write(buffer.Bytes())
-		buffer.Release()
-		return err
-	} else {
-		return t.tunWriter.WriteVectorised(buffers)
-	}
 }
 
 func (t *NativeTun) BatchSize() int {
@@ -474,6 +450,42 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	}
 
 	nopPriority := ruleStart + 10
+	for _, excludePort := range t.options.ExcludeSrcPort {
+		if p4 {
+			it = netlink.NewRule()
+			it.Priority = priority
+			it.Sport = netlink.NewRulePortRange(excludePort.Start, excludePort.End)
+			it.Goto = nopPriority
+			it.Family = unix.AF_INET
+			rules = append(rules, it)
+		}
+		if p6 {
+			it = netlink.NewRule()
+			it.Priority = priority6
+			it.Sport = netlink.NewRulePortRange(excludePort.Start, excludePort.End)
+			it.Goto = nopPriority
+			it.Family = unix.AF_INET6
+			rules = append(rules, it)
+		}
+	}
+	for _, excludePort := range t.options.ExcludeDstPort {
+		if p4 {
+			it = netlink.NewRule()
+			it.Priority = priority
+			it.Dport = netlink.NewRulePortRange(excludePort.Start, excludePort.End)
+			it.Goto = nopPriority
+			it.Family = unix.AF_INET
+			rules = append(rules, it)
+		}
+		if p6 {
+			it = netlink.NewRule()
+			it.Priority = priority6
+			it.Dport = netlink.NewRulePortRange(excludePort.Start, excludePort.End)
+			it.Goto = nopPriority
+			it.Family = unix.AF_INET6
+			rules = append(rules, it)
+		}
+	}
 	for _, excludeRange := range excludeRanges {
 		if p4 {
 			it = netlink.NewRule()
@@ -492,7 +504,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			rules = append(rules, it)
 		}
 	}
-	if len(excludeRanges) > 0 {
+	if len(t.options.ExcludeSrcPort) > 0 || len(t.options.ExcludeDstPort) > 0 || len(excludeRanges) > 0 {
 		if p4 {
 			priority++
 		}
@@ -501,7 +513,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		}
 	}
 	if len(t.options.IncludeInterface) > 0 {
-		matchPriority := priority + 2*len(t.options.IncludeInterface) + 1
+		matchPriority := priority + 2
 		for _, includeInterface := range t.options.IncludeInterface {
 			if p4 {
 				it = netlink.NewRule()
@@ -510,7 +522,6 @@ func (t *NativeTun) rules() []*netlink.Rule {
 				it.Goto = matchPriority
 				it.Family = unix.AF_INET
 				rules = append(rules, it)
-				priority++
 			}
 			if p6 {
 				it = netlink.NewRule()
@@ -519,8 +530,13 @@ func (t *NativeTun) rules() []*netlink.Rule {
 				it.Goto = matchPriority
 				it.Family = unix.AF_INET6
 				rules = append(rules, it)
-				priority6++
 			}
+		}
+		if p4 {
+			priority++
+		}
+		if p6 {
+			priority6++
 		}
 		if p4 {
 			it = netlink.NewRule()
@@ -559,7 +575,6 @@ func (t *NativeTun) rules() []*netlink.Rule {
 				it.Goto = nopPriority
 				it.Family = unix.AF_INET
 				rules = append(rules, it)
-				priority++
 			}
 			if p6 {
 				it = netlink.NewRule()
@@ -568,8 +583,14 @@ func (t *NativeTun) rules() []*netlink.Rule {
 				it.Goto = nopPriority
 				it.Family = unix.AF_INET6
 				rules = append(rules, it)
-				priority6++
 			}
+		}
+
+		if p4 {
+			priority++
+		}
+		if p6 {
+			priority6++
 		}
 	}
 
@@ -644,14 +665,6 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it.Family = unix.AF_INET
 			rules = append(rules, it)
 		}
-		if p4 && !t.options.StrictRoute {
-			it = netlink.NewRule()
-			it.Priority = priority
-			it.IPProto = syscall.IPPROTO_ICMP
-			it.Goto = nopPriority
-			it.Family = unix.AF_INET
-			rules = append(rules, it)
-		}
 		if p6 {
 			it = netlink.NewRule()
 			it.Priority = priority6
@@ -661,16 +674,6 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it.SuppressPrefixlen = 0
 			it.Family = unix.AF_INET6
 			rules = append(rules, it)
-		}
-
-		if p6 && !t.options.StrictRoute {
-			it = netlink.NewRule()
-			it.Priority = priority6
-			it.IPProto = syscall.IPPROTO_ICMPV6
-			it.Goto = nopPriority
-			it.Family = unix.AF_INET6
-			rules = append(rules, it)
-			priority6++
 		}
 	}
 	if p4 {

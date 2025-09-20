@@ -8,9 +8,9 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/sagernet/sing/common"
-	E "github.com/sagernet/sing/common/exceptions"
-	F "github.com/sagernet/sing/common/format"
+	"github.com/metacubex/sing/common"
+	E "github.com/metacubex/sing/common/exceptions"
+	F "github.com/metacubex/sing/common/format"
 )
 
 func (r *autoRedirect) setupIPTables() error {

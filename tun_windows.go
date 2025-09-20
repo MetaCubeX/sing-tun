@@ -9,14 +9,13 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
-	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/atomic"
-	"github.com/sagernet/sing/common/buf"
-	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/windnsapi"
+	"github.com/metacubex/sing/common"
+	E "github.com/metacubex/sing/common/exceptions"
+	"github.com/metacubex/sing/common/windnsapi"
 
 	"github.com/metacubex/sing-tun/internal/winipcfg"
 	"github.com/metacubex/sing-tun/internal/winsys"
@@ -513,11 +512,6 @@ func (t *NativeTun) write(packetElementList [][]byte) (n int, err error) {
 		return 0, nil // Dropping when ring is full.
 	}
 	return 0, fmt.Errorf("write failed: %w", err)
-}
-
-func (t *NativeTun) WriteVectorised(buffers []*buf.Buffer) error {
-	defer buf.ReleaseMulti(buffers)
-	return common.Error(t.write(buf.ToSliceMulti(buffers)))
 }
 
 func (t *NativeTun) Close() error {
