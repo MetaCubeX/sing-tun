@@ -1,5 +1,3 @@
-//go:build with_gvisor && freebsd
-
 package tun
 
 import (
