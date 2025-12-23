@@ -1,0 +1,621 @@
+package tun
+
+import (
+	"fmt"
+	"net"
+	"net/netip"
+	"os"
+	"os/exec"
+	"strings"
+	"syscall"
+	"unsafe"
+
+	"github.com/metacubex/sing/common"
+	"github.com/metacubex/sing/common/buf"
+	"github.com/metacubex/sing/common/bufio"
+	E "github.com/metacubex/sing/common/exceptions"
+	N "github.com/metacubex/sing/common/network"
+
+	"golang.org/x/net/route"
+	"golang.org/x/sys/unix"
+)
+
+const PacketOffset = 4
+
+type NativeTun struct {
+	tunFile      *os.File
+	tunResolv    string
+	tunName      string
+	tunWriter    N.VectorisedWriter
+	mtu          uint32
+	inet4Address [4]byte
+	inet6Address [16]byte
+	options      Options
+}
+
+func New(options Options) (Tun, error) {
+	var nativeTun *NativeTun
+	var tunFd int
+	if options.FileDescriptor == 0 {
+		if len(options.Name) > unix.IFNAMSIZ-1 {
+			return nil, E.New("interface name too long: ", options.Name)
+		}
+
+		// Weird error happens when using pf
+		if options.Name == "tun" {
+			return nil, E.New("bad tun name: ", options.Name)
+		}
+
+		tunFile, err := os.OpenFile("/dev/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return nil, err
+		}
+
+		assignedName, err := getTunName(tunFile)
+		if err != nil {
+			return nil, E.Errors(err, tunFile.Close(), destoryTun("tun"))
+		}
+
+		err = E.Errors(
+			setIfHeadMode(tunFile), setIfMode(tunFile),
+			setND6(assignedName), setPID(tunFile),
+			setMTU(assignedName, int32(options.MTU)),
+			setTunName(options.Name, assignedName),
+		)
+		if err != nil {
+			return nil, E.Errors(err, tunFile.Close(), destoryTun(assignedName))
+		}
+
+		err = E.Errors(
+			setGateway(tunFile, options),
+			setTunAddress(options.Name, options),
+		)
+		if err != nil {
+			return nil, E.Errors(err, tunFile.Close(), destoryTun(options.Name))
+		}
+
+		var resolvString string = ""
+		if options.AutoRoute {
+			var routeRanges []netip.Prefix
+			routeRanges, err = options.BuildAutoRouteRanges(false)
+			if err != nil {
+				return nil, E.Errors(err, tunFile.Close(), destoryTun(options.Name))
+			}
+			gateway4, gateway6 := options.Inet4GatewayAddr(), options.Inet6GatewayAddr()
+			for _, routeRange := range routeRanges {
+				if routeRange.Addr().Is4() {
+					err = addRoute(routeRange, gateway4)
+				} else {
+					err = addRoute(routeRange, gateway6)
+				}
+				if err != nil {
+					return nil, E.Errors(
+						E.Cause(err, "add route: ", routeRange), tunFile.Close(), destoryTun(options.Name),
+					)
+				}
+			}
+
+			if !options.EXP_DisableDNSHijack {
+				resolvString, err = setDNSServers(options)
+				if err != nil {
+					return nil, E.Errors(err, tunFile.Close(), destoryTun(options.Name))
+				}
+			}
+		}
+
+		nativeTun = &NativeTun{
+			tunFile:   tunFile,
+			tunName:   options.Name,
+			tunResolv: resolvString,
+			mtu:       options.MTU,
+			options:   options,
+		}
+	} else {
+		tunFd = options.FileDescriptor
+		nativeTun = &NativeTun{
+			tunFile: os.NewFile(uintptr(tunFd), "utun"),
+			mtu:     options.MTU,
+		}
+	}
+
+	if len(options.Inet4Address) > 0 {
+		nativeTun.inet4Address = options.Inet4Address[0].Addr().As4()
+	}
+	if len(options.Inet6Address) > 0 {
+		nativeTun.inet6Address = options.Inet6Address[0].Addr().As16()
+	}
+	var ok bool
+	nativeTun.tunWriter, ok = bufio.CreateVectorisedWriter(nativeTun.tunFile)
+	if !ok {
+		panic("create vectorised writer")
+	}
+	return nativeTun, nil
+}
+
+func (t *NativeTun) Read(p []byte) (n int, err error) {
+	return t.tunFile.Read(p)
+}
+
+func (t *NativeTun) Write(p []byte) (n int, err error) {
+	//To prevent "address family not supported by protocol family"
+	switch uint(p[3]) {
+	case unix.AF_INET:
+		copy(p[:4], packetHeader4[:])
+	case unix.AF_INET6:
+		copy(p[:4], packetHeader6[:])
+	}
+	return t.tunFile.Write(p)
+}
+
+var (
+	packetHeader4 = [4]byte{0x00, 0x00, 0x00, unix.AF_INET}
+	packetHeader6 = [4]byte{0x00, 0x00, 0x00, unix.AF_INET6}
+)
+
+func (t *NativeTun) WriteVectorised(buffers []*buf.Buffer) error {
+	var packetHeader []byte
+	if buffers[0].Byte(0)>>4 == 4 {
+		packetHeader = packetHeader4[:]
+	} else {
+		packetHeader = packetHeader6[:]
+	}
+	return t.tunWriter.WriteVectorised(append([]*buf.Buffer{buf.As(packetHeader)}, buffers...))
+}
+
+func (t *NativeTun) Close() error {
+	if t.options.AutoRoute && !t.options.EXP_DisableDNSHijack {
+		return E.Errors(restoreDNSServers(t.tunResolv), t.tunFile.Close(), destoryTun(t.tunName))
+	}
+	return E.Errors(t.tunFile.Close(), destoryTun(t.tunName))
+}
+
+const (
+	TUNSIFHEAD             = 0x80047460 // net/if_tun.h
+	TUNSIFMODE             = 0x8004745E // net/if_tun.h
+	TUNGIFNAME             = 0x4020745D // net/if_tun.h
+	TUNSIFPID              = 0x2000745F // net/if_tun.h
+	SIOCGIFINFO_IN6        = 0xC048696C // netinet6/in6_var.h
+	SIOCSIFINFO_IN6        = 0xC048696D // netinet6/in6_var.h
+	ND6_IFF_AUTO_LINKLOCAL = 0x20       // netinet6/nd6.h
+	ND6_IFF_NO_DAD         = 0x100      // netinet6/nd6.h
+)
+
+type Ifreq struct {
+	Name [unix.IFNAMSIZ]byte
+	Data uintptr
+}
+
+type IfreqMTU struct {
+	Name [unix.IFNAMSIZ]byte
+	MTU  int32
+}
+
+type ND6Req struct {
+	Name          [unix.IFNAMSIZ]byte
+	Linkmtu       uint32
+	Maxmtu        uint32
+	Basereachable uint32
+	Reachable     uint32
+	Retrans       uint32
+	Flags         uint32
+	Recalctm      int
+	Chlim         uint8
+	Initialized   uint8
+	Randomseed0   [8]byte
+	Randomseed1   [8]byte
+	Randomid      [8]byte
+}
+
+func getTunName(tunFile *os.File) (string, error) {
+	var errno syscall.Errno
+	var ifr Ifreq
+	err := useFd(tunFile, func(fd uintptr) {
+		_, _, errno = unix.Syscall(
+			syscall.SYS_IOCTL,
+			uintptr(fd),
+			uintptr(TUNGIFNAME),
+			uintptr(unsafe.Pointer(&ifr)),
+		)
+	})
+	if errno != 0 {
+		return "", os.NewSyscallError("TUNGIFNAME", err)
+	}
+	if err != nil {
+		return "", err
+	}
+	return unix.ByteSliceToString(ifr.Name[:]), nil
+}
+
+func destoryTun(name string) error {
+	err := useSocket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0, func(socketFd int) error {
+		var ifr Ifreq
+		copy(ifr.Name[:], name)
+		_, _, errno := unix.Syscall(
+			syscall.SYS_IOCTL,
+			uintptr(socketFd),
+			uintptr(unix.SIOCIFDESTROY),
+			uintptr(unsafe.Pointer(&ifr)),
+		)
+		if errno != 0 {
+			return E.New(errno.Error())
+		}
+		return nil
+	})
+	if err != nil {
+		return os.NewSyscallError("SIOCIFDESTROY", err)
+	}
+	return nil
+}
+
+func setFIB(tunFile *os.File, fib int) error {
+	var errno syscall.Errno
+	err := useFd(tunFile, func(fd uintptr) {
+		_, _, errno = unix.Syscall(
+			syscall.SYS_SETFIB,
+			uintptr(fib),
+			uintptr(0),
+			uintptr(0),
+		)
+	})
+	if errno != 0 {
+		return os.NewSyscallError("SYS_SETFIB", errno)
+	}
+	return err
+}
+
+func setGateway(tunFile *os.File, options Options) error {
+	if !options.AutoRoute {
+		return nil
+	}
+	add_addr, err := unix.SysctlUint32("net.add_addr_allfibs")
+	if err != nil {
+		return err
+	}
+	if add_addr == 0 {
+		err = runCommand("sysctl net.add_addr_allfibs=1")
+		if err != nil {
+			return err
+		}
+	}
+	fibs, err := unix.SysctlUint32("net.fibs")
+	if err != nil {
+		return err
+	}
+	var fibSize int = options.FIBIndex + 1
+	if fibs < uint32(fibSize) {
+		err = runCommand(fmt.Sprintf("sysctl net.fibs=%d\n", fibSize))
+		if err != nil {
+			return err
+		}
+	}
+
+	var defaultGateway4 string = ""
+	var defaultGateway6 string = ""
+	ribMessage, err := route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0)
+	if err != nil {
+		return err
+	}
+	routeMessages, err := route.ParseRIB(route.RIBTypeRoute, ribMessage)
+	if err != nil {
+		return err
+	}
+	for _, rawRouteMessage := range routeMessages {
+		routeMessage := rawRouteMessage.(*route.RouteMessage)
+		if len(routeMessage.Addrs) <= unix.RTAX_NETMASK {
+			continue
+		}
+		gateway4, isIPv4Gateway := routeMessage.Addrs[unix.RTAX_GATEWAY].(*route.Inet4Addr)
+		if !isIPv4Gateway {
+			continue
+		}
+		netmask4, isIPv4Mask := routeMessage.Addrs[unix.RTAX_NETMASK].(*route.Inet4Addr)
+		if !isIPv4Mask {
+			continue
+		}
+		ones, _ := net.IPMask(netmask4.IP[:]).Size()
+		if ones != 0 {
+			continue
+		}
+		defaultGateway4 = netip.AddrFrom4(gateway4.IP).String()
+	}
+	for _, rawRouteMessage := range routeMessages {
+		routeMessage := rawRouteMessage.(*route.RouteMessage)
+		if len(routeMessage.Addrs) <= unix.RTAX_NETMASK {
+			continue
+		}
+		gateway6, isIPv6Gateway := routeMessage.Addrs[unix.RTAX_GATEWAY].(*route.Inet6Addr)
+		if !isIPv6Gateway {
+			continue
+		}
+		netmask6, isIPv6Mask := routeMessage.Addrs[unix.RTAX_NETMASK].(*route.Inet6Addr)
+		if !isIPv6Mask {
+			continue
+		}
+		ones, _ := net.IPMask(netmask6.IP[:]).Size()
+		if ones != 0 {
+			continue
+		}
+		defaultGateway6 = netip.AddrFrom16(gateway6.IP).String()
+	}
+
+	err = setFIB(tunFile, fibSize-1)
+	if err != nil {
+		return err
+	}
+	runCommand(fmt.Sprintf("setfib %d route delete default", fibSize-1))
+	runCommand(fmt.Sprintf("setfib %d route delete -inet6 default", fibSize-1))
+
+	ribMessage, err = route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0)
+	if err != nil {
+		return err
+	}
+	routeMessages, err = route.ParseRIB(route.RIBTypeRoute, ribMessage)
+	if err != nil {
+		return err
+	}
+	if len(routeMessages) == 0 {
+		return E.New("empty fib, please change the `fib_index`")
+	}
+	if defaultGateway4 != "" {
+		err = runCommand(fmt.Sprintf("setfib %d route add default %s", fibSize-1, defaultGateway4))
+		if err != nil {
+			return err
+		}
+	}
+	if defaultGateway6 != "" {
+		interfaceName := options.InterfaceMonitor.DefaultInterface().Name
+		err = runCommand(fmt.Sprintf(
+			"setfib %d route add -inet6 default %s%%%s",
+			fibSize-1, defaultGateway6, interfaceName,
+		))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func setIfHeadMode(tunFile *os.File) error {
+	var errno syscall.Errno
+	ifheadmode := 1
+	err := useFd(tunFile, func(fd uintptr) {
+		_, _, errno = unix.Syscall(
+			syscall.SYS_IOCTL,
+			uintptr(fd),
+			uintptr(TUNSIFHEAD),
+			uintptr(unsafe.Pointer(&ifheadmode)),
+		)
+	})
+	if errno != 0 {
+		return os.NewSyscallError("TUNSIFHEAD", errno)
+	}
+	return err
+}
+
+func setIfMode(tunFile *os.File) error {
+	var errno syscall.Errno
+	ifflags := syscall.IFF_BROADCAST | syscall.IFF_MULTICAST
+	err := useFd(tunFile, func(fd uintptr) {
+		_, _, errno = unix.Syscall(
+			syscall.SYS_IOCTL,
+			uintptr(fd),
+			uintptr(TUNSIFMODE),
+			uintptr(unsafe.Pointer(&ifflags)),
+		)
+	})
+	if errno != 0 {
+		return os.NewSyscallError("TUNSIFMODE", errno)
+	}
+	return err
+}
+
+func setND6(name string) error {
+	var nd6req ND6Req
+	copy(nd6req.Name[:], name)
+	err := useSocket(unix.AF_INET6, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0, func(socketFd int) error {
+		_, _, errno := unix.Syscall(
+			syscall.SYS_IOCTL,
+			uintptr(socketFd),
+			uintptr(SIOCGIFINFO_IN6),
+			uintptr(unsafe.Pointer(&nd6req)),
+		)
+		if errno != 0 {
+			return E.New(errno.Error())
+		}
+		return nil
+	})
+	if err != nil {
+		return os.NewSyscallError("SIOCGIFINFO_IN6", err)
+	}
+	nd6req.Flags = nd6req.Flags &^ ND6_IFF_AUTO_LINKLOCAL
+	nd6req.Flags = nd6req.Flags | ND6_IFF_NO_DAD
+	err = useSocket(unix.AF_INET6, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0, func(socketFd int) error {
+		_, _, errno := unix.Syscall(
+			syscall.SYS_IOCTL,
+			uintptr(socketFd),
+			uintptr(SIOCSIFINFO_IN6),
+			uintptr(unsafe.Pointer(&nd6req)),
+		)
+		if errno != 0 {
+			return E.New(errno.Error())
+		}
+		return nil
+	})
+	if err != nil {
+		return os.NewSyscallError("SIOCSIFINFO_IN6", err)
+	}
+	return nil
+}
+
+func setPID(tunFile *os.File) error {
+	var errno syscall.Errno
+	err := useFd(tunFile, func(fd uintptr) {
+		_, _, errno = unix.Syscall(
+			syscall.SYS_IOCTL,
+			uintptr(fd),
+			uintptr(TUNSIFPID),
+			uintptr(0),
+		)
+	})
+	if errno != 0 {
+		return os.NewSyscallError("TUNSIFPID", err)
+	}
+	return err
+}
+
+func setMTU(name string, MTU int32) error {
+	var ifrMTU IfreqMTU
+	copy(ifrMTU.Name[:], []byte(name))
+	ifrMTU.MTU = MTU
+	err := useSocket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0, func(socketFd int) error {
+		_, _, errno := unix.Syscall(
+			syscall.SYS_IOCTL,
+			uintptr(socketFd),
+			uintptr(unix.SIOCSIFMTU),
+			uintptr(unsafe.Pointer(&ifrMTU)),
+		)
+		if errno != 0 {
+			return E.New(errno.Error())
+		}
+		return nil
+	})
+	if err != nil {
+		return os.NewSyscallError("SIOCSIFMTU", err)
+	}
+	return nil
+}
+
+func setTunName(name string, assignedName string) error {
+	err := useSocket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0, func(socketFd int) error {
+		var newName [unix.IFNAMSIZ]byte
+		copy(newName[:], name)
+		var ifr Ifreq
+		copy(ifr.Name[:], assignedName)
+		ifr.Data = uintptr(unsafe.Pointer(&newName[0]))
+		_, _, errno := unix.Syscall(
+			syscall.SYS_IOCTL,
+			uintptr(socketFd),
+			uintptr(unix.SIOCSIFNAME),
+			uintptr(unsafe.Pointer(&ifr)),
+		)
+		if errno != 0 {
+			return E.New(errno.Error())
+		}
+		return nil
+	})
+	if err != nil {
+		return os.NewSyscallError("SIOCSIFNAME", err)
+	}
+	return nil
+}
+
+func setTunAddress(name string, options Options) error {
+	if len(options.Inet4Address) > 0 {
+		err := runCommand(fmt.Sprintf("/sbin/ifconfig %s inet %s up", name, options.Inet4Address[0].String()))
+		if err != nil {
+			return err
+		}
+	}
+	if len(options.Inet6Address) > 0 {
+		err := runCommand(fmt.Sprintf("/sbin/ifconfig %s inet6 %s up", name, options.Inet6Address[0].String()))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+const resolvPath = "/etc/resolv.conf"
+
+func setDNSServers(options Options) (string, error) {
+	resolvByte, err := os.ReadFile(resolvPath)
+	if err != nil {
+		return "", err
+	}
+	resolvString := unix.ByteSliceToString(resolvByte[:])
+	var sb strings.Builder
+	sb.WriteString("search localdomain\n")
+	if len(options.Inet4Address) > 0 {
+		sb.WriteString(fmt.Sprintf("nameserver %s\n", options.Inet4Address[0].Addr().Next().String()))
+	}
+	if len(options.Inet6Address) > 0 {
+		sb.WriteString(fmt.Sprintf("nameserver %s\n", options.Inet6Address[0].Addr().Next().String()))
+	}
+	newResolvByte := []byte(sb.String())
+	err = os.WriteFile(resolvPath, newResolvByte[:], 0644)
+	if err != nil {
+		return resolvString, err
+	}
+	return resolvString, nil
+}
+
+func restoreDNSServers(resolvString string) error {
+	resolvByte := []byte(resolvString)
+	err := os.WriteFile(resolvPath, resolvByte[:], 0644)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func runCommand(commandStr string) error {
+	var command *exec.Cmd
+	command = exec.Command(
+		"/bin/sh", "-c", commandStr)
+	combinedOutput, err := command.CombinedOutput()
+	if err != nil {
+		return E.New(commandStr, ": ", string(combinedOutput))
+	}
+	return nil
+}
+
+func useSocket(domain, typ, proto int, block func(socketFd int) error) error {
+	socketFd, err := unix.Socket(domain, typ, proto)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(socketFd)
+	return block(socketFd)
+}
+
+func useFd(tunFile *os.File, block func(fd uintptr)) error {
+	sysconn, err := tunFile.SyscallConn()
+	if err != nil {
+		return err
+	}
+	return sysconn.Control(block)
+}
+
+func addRoute(destination netip.Prefix, gateway netip.Addr) error {
+	routeMessage := route.RouteMessage{
+		Type:    unix.RTM_ADD,
+		Flags:   unix.RTF_UP | unix.RTF_STATIC | unix.RTF_GATEWAY,
+		Version: unix.RTM_VERSION,
+		Seq:     1,
+	}
+	if gateway.Is4() {
+		routeMessage.Addrs = []route.Addr{
+			syscall.RTAX_DST:     &route.Inet4Addr{IP: destination.Addr().As4()},
+			syscall.RTAX_NETMASK: &route.Inet4Addr{IP: netip.MustParseAddr(net.IP(net.CIDRMask(destination.Bits(), 32)).String()).As4()},
+			syscall.RTAX_GATEWAY: &route.Inet4Addr{IP: gateway.As4()},
+		}
+	} else {
+		routeMessage.Addrs = []route.Addr{
+			syscall.RTAX_DST:     &route.Inet6Addr{IP: destination.Addr().As16()},
+			syscall.RTAX_NETMASK: &route.Inet6Addr{IP: netip.MustParseAddr(net.IP(net.CIDRMask(destination.Bits(), 128)).String()).As16()},
+			syscall.RTAX_GATEWAY: &route.Inet6Addr{IP: gateway.As16()},
+		}
+	}
+	request, err := routeMessage.Marshal()
+	if err != nil {
+		return err
+	}
+	return useSocket(unix.AF_ROUTE, unix.SOCK_RAW, 0, func(socketFd int) error {
+		err := unix.SetsockoptInt(socketFd, unix.SOL_SOCKET, unix.SO_SETFIB, syscall.RT_DEFAULT_FIB)
+		if err != nil {
+			return os.NewSyscallError("SO_SETFIB", err)
+		}
+		return common.Error(unix.Write(socketFd, request))
+	})
+}
