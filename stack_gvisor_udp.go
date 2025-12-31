@@ -7,7 +7,7 @@ import (
 	"math"
 	"net/netip"
 	"os"
-	"sync"
+	"sync/atomic"
 
 	"github.com/metacubex/sing/common/buf"
 	E "github.com/metacubex/sing/common/exceptions"
@@ -55,23 +55,43 @@ func (f *UDPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pac
 		sBuffer,
 		upstreamMetadata,
 		func(natConn N.PacketConn) N.PacketWriter {
-			return &UDPBackWriter{
+			writer := &UDPBackWriter{
 				stack:         f.stack,
 				source:        id.RemoteAddress,
 				sourcePort:    id.RemotePort,
 				sourceNetwork: proto,
 			}
+			writer.packet.Store(pkt.IncRef())
+			return writer
 		},
 	)
 	return true
 }
 
 type UDPBackWriter struct {
-	access        sync.Mutex
 	stack         *stack.Stack
+	packet        atomic.Pointer[stack.PacketBuffer]
 	source        tcpip.Address
 	sourcePort    uint16
 	sourceNetwork tcpip.NetworkProtocolNumber
+}
+
+func (w *UDPBackWriter) HandshakeSuccess() error {
+	packet := w.packet.Swap(nil)
+	if packet != nil {
+		packet.DecRef()
+	}
+	return nil
+}
+
+func (w *UDPBackWriter) HandshakeFailure(err error) error {
+	packet := w.packet.Swap(nil)
+	if packet == nil {
+		return os.ErrInvalid
+	}
+	wErr := gWriteUnreachable(w.stack, packet)
+	packet.DecRef()
+	return wErr
 }
 
 func (w *UDPBackWriter) WritePacket(packetBuffer *buf.Buffer, destination M.Socksaddr) error {

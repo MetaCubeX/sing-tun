@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"syscall"
 	"time"
 
@@ -607,13 +608,18 @@ func (s *System) processIPv4UDP(ipHdr header.IPv4, udpHdr header.UDP) error {
 		headerLen := ipHdr.HeaderLength() + header.UDPMinimumSize
 		headerCopy := make([]byte, headerLen)
 		copy(headerCopy, ipHdr[:headerLen])
-		return &systemUDPPacketWriter4{
-			s.tun,
-			s.frontHeadroom + PacketOffset,
-			headerCopy,
-			source,
-			s.txChecksumOffload,
+		packetCopy := make([]byte, len(ipHdr))
+		copy(packetCopy, ipHdr)
+		writer := &systemUDPPacketWriter4{
+			stack:             s,
+			tun:               s.tun,
+			frontHeadroom:     s.frontHeadroom + PacketOffset,
+			header:            headerCopy,
+			source:            source,
+			txChecksumOffload: s.txChecksumOffload,
 		}
+		writer.packet.Store(packetCopy)
+		return writer
 	})
 	return nil
 }
@@ -636,13 +642,18 @@ func (s *System) processIPv6UDP(ipHdr header.IPv6, udpHdr header.UDP) error {
 		headerLen := len(ipHdr) - int(ipHdr.PayloadLength()) + header.UDPMinimumSize
 		headerCopy := make([]byte, headerLen)
 		copy(headerCopy, ipHdr[:headerLen])
-		return &systemUDPPacketWriter6{
-			s.tun,
-			s.frontHeadroom + PacketOffset,
-			headerCopy,
-			source,
-			s.txChecksumOffload,
+		packetCopy := make([]byte, len(ipHdr))
+		copy(packetCopy, ipHdr)
+		writer := &systemUDPPacketWriter6{
+			stack:             s,
+			tun:               s.tun,
+			frontHeadroom:     s.frontHeadroom + PacketOffset,
+			header:            headerCopy,
+			source:            source,
+			txChecksumOffload: s.txChecksumOffload,
 		}
+		writer.packet.Store(packetCopy)
+		return writer
 	})
 	return nil
 }
@@ -804,11 +815,26 @@ func (s *System) rejectIPv6WithICMP(ipHdr header.IPv6, code header.ICMPv6Code) e
 }
 
 type systemUDPPacketWriter4 struct {
+	stack             *System
 	tun               Tun
 	frontHeadroom     int
 	header            []byte
 	source            netip.AddrPort
 	txChecksumOffload bool
+	packet            common.TypedValue[header.IPv4]
+}
+
+func (w *systemUDPPacketWriter4) HandshakeSuccess() error {
+	w.packet.Store(nil)
+	return nil
+}
+
+func (w *systemUDPPacketWriter4) HandshakeFailure(err error) error {
+	packet := w.packet.Swap(nil)
+	if packet == nil {
+		return os.ErrInvalid
+	}
+	return w.stack.rejectIPv4WithICMP(packet, header.ICMPv4PortUnreachable)
 }
 
 func (w *systemUDPPacketWriter4) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
@@ -842,11 +868,26 @@ func (w *systemUDPPacketWriter4) WritePacket(buffer *buf.Buffer, destination M.S
 }
 
 type systemUDPPacketWriter6 struct {
+	stack             *System
 	tun               Tun
 	frontHeadroom     int
 	header            []byte
 	source            netip.AddrPort
 	txChecksumOffload bool
+	packet            common.TypedValue[header.IPv6]
+}
+
+func (w *systemUDPPacketWriter6) HandshakeSuccess() error {
+	w.packet.Store(nil)
+	return nil
+}
+
+func (w *systemUDPPacketWriter6) HandshakeFailure(err error) error {
+	packet := w.packet.Swap(nil)
+	if packet == nil {
+		return os.ErrInvalid
+	}
+	return w.stack.rejectIPv6WithICMP(packet, header.ICMPv6PortUnreachable)
 }
 
 func (w *systemUDPPacketWriter6) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
