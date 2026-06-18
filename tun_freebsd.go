@@ -106,6 +106,16 @@ func openTun(name string) (*os.File, error) {
 
 func (t *NativeTun) configure() error {
 	name := t.options.Name
+	// Tag the interface with the caller-supplied description, if any. FreeBSD
+	// keeps this description even after the process that opened the tun dies, so
+	// the caller (e.g. mihomo) can use it as a marker to identify and clean up
+	// tun devices it created. sing-tun assigns no meaning to the value and skips
+	// this step entirely when no description was provided.
+	if t.options.FreeBSDInterfaceDescription != "" {
+		if err := shell.Exec("ifconfig", name, "description", t.options.FreeBSDInterfaceDescription).Run(); err != nil {
+			return E.Cause(err, "set interface description")
+		}
+	}
 	// Configure MTU and addresses via ifconfig(8). Using the userspace tool
 	// rather than hand-rolled ioctl structs avoids any risk of passing a
 	// malformed request to the kernel.
