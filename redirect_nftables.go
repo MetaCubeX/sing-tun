@@ -66,10 +66,23 @@ func (r *autoRedirect) setupNFTables() error {
 				return err
 			}
 			r.nftablesCreateUnreachable(nft, table, chainOutput)
-			err = r.nftablesCreateRedirect(nft, table, chainOutput)
-			if err != nil {
-				return err
-			}
+			// Kernel 6.12+: No NAT redirect on OUTPUT. Mark for PREROUTING TPROXY.
+			nft.AddRule(&nftables.Rule{
+				Table: table,
+				Chain: chainOutput,
+				Exprs: []expr.Any{
+					&expr.Immediate{
+						Register: 1,
+						Data:     binaryutil.NativeEndian.PutUint32(r.tunOptions.AutoRedirectInputMark),
+					},
+					&expr.Meta{
+						Key:            expr.MetaKeyMARK,
+						Register:       1,
+						SourceRegister: true,
+					},
+					&expr.Counter{},
+				},
+			})
 			if len(r.tunOptions.Inet4LoopbackAddress) > 0 || len(r.tunOptions.Inet6LoopbackAddress) > 0 {
 				chainOutputRoute := nft.AddChain(&nftables.Chain{
 					Name:     "output_route",
@@ -97,17 +110,43 @@ func (r *autoRedirect) setupNFTables() error {
 			r.nftablesCreateUnreachable(nft, table, chainOutputUDP)
 			r.nftablesCreateMark(nft, table, chainOutputUDP)
 		} else {
-			err = r.nftablesCreateRedirect(nft, table, chainOutput, &expr.Meta{
-				Key:      expr.MetaKeyOIFNAME,
-				Register: 1,
-			}, &expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     nftablesIfname(r.tunOptions.Name),
+			// Kernel 6.12+ rejects ChainTypeNAT on OUTPUT.
+			// Use fwmark: mark non-excluded traffic, let PREROUTING TPROXY catch it.
+			nft.AddRule(&nftables.Rule{
+				Table: table,
+				Chain: chainOutput,
+				Exprs: []expr.Any{
+					&expr.Meta{
+						Key:      expr.MetaKeyOIFNAME,
+						Register: 1,
+					},
+					&expr.Cmp{
+						Op:       expr.CmpOpEq,
+						Register: 1,
+						Data:     nftablesIfname(r.tunOptions.Name),
+					},
+					&expr.Counter{},
+					&expr.Verdict{
+						Kind: expr.VerdictReturn,
+					},
+				},
 			})
-			if err != nil {
-				return err
-			}
+			nft.AddRule(&nftables.Rule{
+				Table: table,
+				Chain: chainOutput,
+				Exprs: []expr.Any{
+					&expr.Immediate{
+						Register: 1,
+						Data:     binaryutil.NativeEndian.PutUint32(r.tunOptions.AutoRedirectInputMark),
+					},
+					&expr.Meta{
+						Key:            expr.MetaKeyMARK,
+						Register:       1,
+						SourceRegister: true,
+					},
+					&expr.Counter{},
+				},
+			})
 		}
 	}
 
