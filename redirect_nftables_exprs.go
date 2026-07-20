@@ -98,7 +98,15 @@ func nftablesCreateIPConst(
 	}
 	setElements := common.Map(addressList, func(addr netip.Addr) nftables.SetElement { return nftables.SetElement{Key: addr.AsSlice()} })
 	if id == 0 {
-		err := nft.AddSet(mySet, setElements)
+		err := nft.AddSet(mySet, nil)
+		if err != nil {
+			return nil, err
+		}
+		// commit set creation before adding elements (avoids EEXIST on kernel 6.12+)
+		if err := nft.Flush(); err != nil {
+			return nil, err
+		}
+		err = nft.SetAddElements(mySet, setElements)
 		if err != nil {
 			return nil, err
 		}
@@ -106,6 +114,10 @@ func nftablesCreateIPConst(
 	} else {
 		err := nft.AddSet(mySet, nil)
 		if err != nil {
+			return nil, err
+		}
+		// commit set creation before adding elements (avoids EEXIST on kernel 6.12+)
+		if err := nft.Flush(); err != nil {
 			return nil, err
 		}
 	}
@@ -196,7 +208,15 @@ func nftablesCreateIPSet(
 		mySet.Constant = true
 	}
 	if id == 0 {
-		err := nft.AddSet(mySet, setElements)
+		err := nft.AddSet(mySet, nil)
+		if err != nil {
+			return nil, err
+		}
+		// commit set creation before adding elements (avoids EEXIST on kernel 6.12+)
+		if err := nft.Flush(); err != nil {
+			return nil, err
+		}
+		err = nft.SetAddElements(mySet, setElements)
 		if err != nil {
 			return nil, err
 		}
@@ -206,6 +226,10 @@ func nftablesCreateIPSet(
 	} else {
 		err := nft.AddSet(mySet, nil)
 		if err != nil {
+			return nil, err
+		}
+		// Commit set creation before adding elements (avoids EEXIST on kernel 6.12+)
+		if err := nft.Flush(); err != nil {
 			return nil, err
 		}
 	}
