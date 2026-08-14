@@ -34,6 +34,7 @@ type NativeTun struct {
 	interfaceCallback *list.Element[DefaultInterfaceUpdateCallback]
 	options           Options
 	dnatBypass        *autoRouteDNATBypass
+	ipvsDNSBypass     *autoRouteIPVSDNSBypass
 	ruleIndex6        []int
 	readAccess        sync.Mutex
 	writeAccess       sync.Mutex
@@ -390,6 +391,9 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 
 	if t.options.AutoRoute && runtime.GOOS != "android" {
 		t.enableAutoRouteDNATBypass(prepareAutoRouteDNATBypass)
+		if !t.options.AutoRedirectMarkMode {
+			t.enableAutoRouteIPVSDNSBypass(ipvsTablePath)
+		}
 	}
 
 	err = t.setRoute(tunLink)
@@ -409,6 +413,9 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	}
 
 	t.setSearchDomainForSystemdResolved()
+	if t.ipvsDNSBypass != nil {
+		t.ipvsDNSBypass.Start(t.refreshIPVSDNSBypass)
+	}
 
 	if t.options.AutoRoute && runtime.GOOS == "android" {
 		t.interfaceCallback = t.options.InterfaceMonitor.RegisterCallback(t.routeUpdate)
@@ -440,6 +447,9 @@ func (t *NativeTun) enableGSO() error {
 }
 
 func (t *NativeTun) Close() error {
+	if t.ipvsDNSBypass != nil {
+		t.ipvsDNSBypass.Close()
+	}
 	if t.interfaceCallback != nil {
 		t.options.InterfaceMonitor.UnregisterCallback(t.interfaceCallback)
 	}
@@ -628,6 +638,27 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it.Goto = nopPriority
 			it.Family = unix.AF_INET6
 			rules = append(rules, it)
+			priority6++
+		}
+	}
+	if t.ipvsDNSBypass != nil {
+		var added4, added6 bool
+		for _, destination := range t.ipvsDNSBypass.Destinations() {
+			it = t.ipvsDNSRule(destination)
+			if it == nil {
+				continue
+			}
+			rules = append(rules, it)
+			if destination.address.Is4() {
+				added4 = true
+			} else {
+				added6 = true
+			}
+		}
+		if added4 {
+			priority++
+		}
+		if added6 {
 			priority6++
 		}
 	}
