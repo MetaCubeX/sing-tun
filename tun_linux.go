@@ -33,6 +33,7 @@ type NativeTun struct {
 	tunFile           *os.File
 	interfaceCallback *list.Element[DefaultInterfaceUpdateCallback]
 	options           Options
+	dnatBypass        *autoRouteDNATBypass
 	ruleIndex6        []int
 	readAccess        sync.Mutex
 	writeAccess       sync.Mutex
@@ -387,20 +388,24 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 		}
 	}
 
+	if t.options.AutoRoute && runtime.GOOS != "android" {
+		t.enableAutoRouteDNATBypass(prepareAutoRouteDNATBypass)
+	}
+
 	err = t.setRoute(tunLink)
 	if err != nil {
 		_ = t.unsetRoute0(tunLink)
-		return err
+		return E.Errors(err, common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
 
 	err = t.unsetRules()
 	if err != nil {
-		return E.Cause(err, "cleanup rules")
+		return E.Errors(E.Cause(err, "cleanup rules"), t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
 	err = t.setRules()
 	if err != nil {
 		_ = t.unsetRules()
-		return err
+		return E.Errors(err, t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
 
 	t.setSearchDomainForSystemdResolved()
@@ -440,7 +445,7 @@ func (t *NativeTun) Close() error {
 	}
 	t.unsetSearchDomainForSystemdResolved()
 	t.unsetAddresses()
-	return E.Errors(t.unsetRoute(), t.unsetRules(), common.Close(common.PtrOrNil(t.tunFile)))
+	return E.Errors(t.unsetRules(), t.unsetRoute(), common.Close(common.PtrOrNil(t.dnatBypass)), common.Close(common.PtrOrNil(t.tunFile)))
 }
 
 func (t *NativeTun) TXChecksumOffload() bool {
@@ -534,6 +539,9 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it = netlink.NewRule()
 			it.Priority = priority
 			it.Mark = t.options.AutoRedirectOutputMark
+			if t.dnatBypass != nil {
+				it.Mark = t.options.autoRouteDNATBypassMark()
+			}
 			it.MarkSet = true
 			it.Goto = priority + 2
 			it.Family = unix.AF_INET
@@ -558,6 +566,9 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it = netlink.NewRule()
 			it.Priority = priority6
 			it.Mark = t.options.AutoRedirectOutputMark
+			if t.dnatBypass != nil {
+				it.Mark = t.options.autoRouteDNATBypassMark()
+			}
 			it.MarkSet = true
 			it.Goto = priority6 + 2
 			it.Family = unix.AF_INET6
@@ -598,6 +609,28 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	}
 
 	nopPriority := ruleStart + 10
+	if t.dnatBypass != nil {
+		if p4 {
+			it = netlink.NewRule()
+			it.Priority = priority
+			it.Mark = t.options.autoRouteDNATBypassMark()
+			it.MarkSet = true
+			it.Goto = nopPriority
+			it.Family = unix.AF_INET
+			rules = append(rules, it)
+			priority++
+		}
+		if p6 {
+			it = netlink.NewRule()
+			it.Priority = priority6
+			it.Mark = t.options.autoRouteDNATBypassMark()
+			it.MarkSet = true
+			it.Goto = nopPriority
+			it.Family = unix.AF_INET6
+			rules = append(rules, it)
+			priority6++
+		}
+	}
 	for _, excludePort := range t.options.ExcludeSrcPort {
 		if p4 {
 			it = netlink.NewRule()
