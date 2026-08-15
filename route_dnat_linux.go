@@ -17,7 +17,11 @@ import (
 	"github.com/metacubex/sing/common/logger"
 )
 
-const conntrackStatusDNAT = 1 << 5
+const (
+	conntrackStatusDNAT = 1 << 5
+	// Reserve the low 12 bits for the bypass mark and preserve marks owned by other network components.
+	autoRouteDNATBypassMarkFieldMask = 0xFFF
+)
 
 const (
 	ipv4ConfPath     = "/proc/sys/net/ipv4/conf"
@@ -98,10 +102,22 @@ func newAutoRouteDNATBypass(options *Options) (*autoRouteDNATBypass, error) {
 }
 
 func (o *Options) autoRouteDNATBypassMark() uint32 {
-	if o.AutoRedirectOutputMark != 0 {
-		return o.AutoRedirectOutputMark
+	outputMark := o.AutoRedirectOutputMark
+	if outputMark == 0 {
+		outputMark = DefaultAutoRedirectOutputMark
 	}
-	return DefaultAutoRedirectOutputMark
+	return outputMark & o.autoRouteDNATBypassMask()
+}
+
+func (o *Options) autoRouteDNATBypassMask() uint32 {
+	outputMark := o.AutoRedirectOutputMark
+	if outputMark == 0 {
+		outputMark = DefaultAutoRedirectOutputMark
+	}
+	if outputMark&autoRouteDNATBypassMarkFieldMask == 0 {
+		return outputMark
+	}
+	return autoRouteDNATBypassMarkFieldMask
 }
 
 func (b *autoRouteDNATBypass) Start() error {
@@ -273,6 +289,7 @@ func (b *autoRouteDNATBypass) cleanupNFTables() {
 
 func dnatMarkExpressions(options *Options) []expr.Any {
 	expressions := nftablesDNATStatusExpressions()
+	markMask := options.autoRouteDNATBypassMask()
 	if options.AutoRedirectMarkMode {
 		expressions = append(expressions,
 			&expr.Meta{
@@ -287,9 +304,16 @@ func dnatMarkExpressions(options *Options) []expr.Any {
 		)
 	}
 	return append(expressions,
-		&expr.Immediate{
+		&expr.Meta{
+			Key:      expr.MetaKeyMARK,
 			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(options.autoRouteDNATBypassMark()),
+		},
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           binaryutil.NativeEndian.PutUint32(^markMask),
+			Xor:            binaryutil.NativeEndian.PutUint32(options.autoRouteDNATBypassMark()),
 		},
 		&expr.Meta{
 			Key:            expr.MetaKeyMARK,
@@ -301,6 +325,7 @@ func dnatMarkExpressions(options *Options) []expr.Any {
 }
 
 func (b *autoRouteDNATBypass) setupIPTables() error {
+	markMask := b.options.autoRouteDNATBypassMask()
 	for _, path := range []string{b.iptablesPath, b.ip6tablesPath} {
 		if path == "" {
 			continue
@@ -311,14 +336,14 @@ func (b *autoRouteDNATBypass) setupIPTables() error {
 		if err := b.runIPTables(
 			path, "-t", "mangle", "-A", b.chainName,
 			"-m", "addrtype", "--dst-type", "LOCAL",
-			"-j", "MARK", "--set-mark", strconv.FormatUint(uint64(b.options.autoRouteDNATBypassMark()), 10),
+			"-j", "MARK", "--set-xmark", fmt.Sprintf("%#x/%#x", b.options.autoRouteDNATBypassMark(), markMask),
 		); err != nil {
 			return err
 		}
 		if err := b.runIPTables(
 			path, "-t", "mangle", "-A", b.chainName,
 			"-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "REPLY",
-			"-j", "MARK", "--set-mark", strconv.FormatUint(uint64(b.options.autoRouteDNATBypassMark()), 10),
+			"-j", "MARK", "--set-xmark", fmt.Sprintf("%#x/%#x", b.options.autoRouteDNATBypassMark(), markMask),
 		); err != nil {
 			return err
 		}
