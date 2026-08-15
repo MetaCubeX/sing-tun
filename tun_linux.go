@@ -539,6 +539,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	var it *netlink.Rule
 
 	excludeRanges := t.options.ExcludedRanges()
+	dnatBypassMarkMask := int(t.options.autoRouteDNATBypassMask())
 
 	ruleStart := t.options.IPRoute2RuleIndex
 	priority := ruleStart
@@ -551,6 +552,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it.Mark = t.options.AutoRedirectOutputMark
 			if t.dnatBypass != nil {
 				it.Mark = t.options.autoRouteDNATBypassMark()
+				it.Mask = dnatBypassMarkMask
 			}
 			it.MarkSet = true
 			it.Goto = priority + 2
@@ -578,6 +580,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it.Mark = t.options.AutoRedirectOutputMark
 			if t.dnatBypass != nil {
 				it.Mark = t.options.autoRouteDNATBypassMark()
+				it.Mask = dnatBypassMarkMask
 			}
 			it.MarkSet = true
 			it.Goto = priority6 + 2
@@ -624,6 +627,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it = netlink.NewRule()
 			it.Priority = priority
 			it.Mark = t.options.autoRouteDNATBypassMark()
+			it.Mask = dnatBypassMarkMask
 			it.MarkSet = true
 			it.Goto = nopPriority
 			it.Family = unix.AF_INET
@@ -634,6 +638,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it = netlink.NewRule()
 			it.Priority = priority6
 			it.Mark = t.options.autoRouteDNATBypassMark()
+			it.Mask = dnatBypassMarkMask
 			it.MarkSet = true
 			it.Goto = nopPriority
 			it.Family = unix.AF_INET6

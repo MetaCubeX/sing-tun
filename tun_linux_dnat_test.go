@@ -44,8 +44,32 @@ func TestAutoRouteDNATBypassRule(t *testing.T) {
 	require.NotEmpty(t, rules)
 	require.Equal(t, DefaultIPRoute2RuleIndex, rules[0].Priority)
 	require.True(t, rules[0].MarkSet)
-	require.Equal(t, uint32(DefaultAutoRedirectOutputMark), rules[0].Mark)
+	require.Equal(t, uint32(0x024), rules[0].Mark)
+	require.Equal(t, 0xFFF, rules[0].Mask)
 	require.Equal(t, DefaultIPRoute2RuleIndex+10, rules[0].Goto)
+}
+
+func TestAutoRedirectDNATBypassRule(t *testing.T) {
+	nativeTun := &NativeTun{
+		dnatBypass: &autoRouteDNATBypass{},
+		options: Options{
+			AutoRoute:              true,
+			AutoRedirectMarkMode:   true,
+			AutoRedirectInputMark:  DefaultAutoRedirectInputMark,
+			AutoRedirectOutputMark: DefaultAutoRedirectOutputMark,
+			IPRoute2RuleIndex:      DefaultIPRoute2RuleIndex,
+			Inet4Address:           []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
+			Inet6Address:           []netip.Prefix{netip.MustParsePrefix("fdfe:dcba:9876::1/126")},
+		},
+	}
+
+	rules := nativeTun.rules()
+	require.GreaterOrEqual(t, len(rules), 6)
+	for _, index := range []int{0, 3} {
+		require.True(t, rules[index].MarkSet)
+		require.Equal(t, uint32(0x024), rules[index].Mark)
+		require.Equal(t, 0xFFF, rules[index].Mask)
+	}
 }
 
 func TestAutoRouteWithoutDNATBypassRule(t *testing.T) {
@@ -62,7 +86,6 @@ func TestAutoRouteWithoutDNATBypassRule(t *testing.T) {
 	for _, rule := range nativeTun.rules() {
 		require.False(t,
 			rule.MarkSet &&
-				rule.Mark == DefaultAutoRedirectOutputMark &&
 				rule.Goto == DefaultIPRoute2RuleIndex+10,
 			"DNAT bypass rule must not be installed without an active firewall backend",
 		)
@@ -87,17 +110,23 @@ func TestEnableAutoRouteDNATBypassDegradesOnUnavailableBackend(t *testing.T) {
 func TestDNATMarkExpressions(t *testing.T) {
 	options := &Options{AutoRedirectOutputMark: DefaultAutoRedirectOutputMark}
 	expressions := dnatMarkExpressions(options)
-	require.Len(t, expressions, 6)
+	require.Len(t, expressions, 7)
 
 	status, loaded := expressions[0].(*expr.Ct)
 	require.True(t, loaded)
 	require.Equal(t, expr.CtKeySTATUS, status.Key)
 
-	mark, loaded := expressions[3].(*expr.Immediate)
+	mark, loaded := expressions[3].(*expr.Meta)
 	require.True(t, loaded)
-	require.Equal(t, binaryutil.NativeEndian.PutUint32(DefaultAutoRedirectOutputMark), mark.Data)
+	require.Equal(t, expr.MetaKeyMARK, mark.Key)
+	require.False(t, mark.SourceRegister)
 
-	meta, loaded := expressions[4].(*expr.Meta)
+	mask, loaded := expressions[4].(*expr.Bitwise)
+	require.True(t, loaded)
+	require.Equal(t, binaryutil.NativeEndian.PutUint32(^uint32(0xFFF)), mask.Mask)
+	require.Equal(t, binaryutil.NativeEndian.PutUint32(0x024), mask.Xor)
+
+	meta, loaded := expressions[5].(*expr.Meta)
 	require.True(t, loaded)
 	require.Equal(t, expr.MetaKeyMARK, meta.Key)
 	require.True(t, meta.SourceRegister)
@@ -109,7 +138,7 @@ func TestDNATMarkExpressionsExcludeAutoRedirectInputMark(t *testing.T) {
 		AutoRedirectInputMark: DefaultAutoRedirectInputMark,
 	}
 	expressions := dnatMarkExpressions(options)
-	require.Len(t, expressions, 8)
+	require.Len(t, expressions, 9)
 	mark, loaded := expressions[3].(*expr.Meta)
 	require.True(t, loaded)
 	require.Equal(t, expr.MetaKeyMARK, mark.Key)
@@ -120,7 +149,19 @@ func TestDNATMarkExpressionsExcludeAutoRedirectInputMark(t *testing.T) {
 
 func TestAutoRouteDNATBypassUsesDefaultMark(t *testing.T) {
 	options := Options{}
-	require.Equal(t, uint32(DefaultAutoRedirectOutputMark), options.autoRouteDNATBypassMark())
+	require.Equal(t, uint32(0x024), options.autoRouteDNATBypassMark())
+}
+
+func TestAutoRouteDNATBypassUsesConfiguredMarkField(t *testing.T) {
+	options := Options{AutoRedirectOutputMark: 0x12345678}
+	require.Equal(t, uint32(0x678), options.autoRouteDNATBypassMark())
+	require.Equal(t, uint32(0xFFF), options.autoRouteDNATBypassMask())
+}
+
+func TestAutoRouteDNATBypassUsesConfiguredHighMark(t *testing.T) {
+	options := Options{AutoRedirectOutputMark: 0x5000}
+	require.Equal(t, uint32(0x5000), options.autoRouteDNATBypassMark())
+	require.Equal(t, uint32(0x5000), options.autoRouteDNATBypassMask())
 }
 
 func TestAutoRedirectDisablesNFTables(t *testing.T) {
@@ -285,8 +326,11 @@ func TestAutoRouteDNATBypassIPTables(t *testing.T) {
 		iptablesPath: iptablesPath,
 	}
 	require.NoError(t, bypass.Start())
+	output, err := exec.Command(iptablesPath, "-t", "mangle", "-S", bypass.chainName).CombinedOutput()
+	require.NoError(t, err, string(output))
+	require.Contains(t, string(output), "--set-xmark 0x24/0xfff")
 	require.NoError(t, bypass.Close())
 
-	output, err := exec.Command(iptablesPath, "-t", "mangle", "-S", bypass.chainName).CombinedOutput()
+	output, err = exec.Command(iptablesPath, "-t", "mangle", "-S", bypass.chainName).CombinedOutput()
 	require.Error(t, err, string(output))
 }
