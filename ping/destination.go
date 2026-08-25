@@ -88,7 +88,7 @@ func (d *Destination) loopRead() {
 		err = d.conn.ReadIP(buffer)
 		if err != nil {
 			buffer.Release()
-			if !E.IsClosed(err) {
+			if !E.IsClosedOrCanceled(err) {
 				d.logger.ErrorContext(d.ctx, E.Cause(err, "receive ICMP echo reply"))
 			}
 			return

@@ -101,7 +101,7 @@ func (d *GVisorDestination) loopRead() {
 		n, err := d.conn.Read(buffer.FreeBytes())
 		if err != nil {
 			buffer.Release()
-			if !E.IsClosed(err) {
+			if !E.IsClosedOrCanceled(err) {
 				d.logger.ErrorContext(d.ctx, E.Cause(err, "receive ICMP echo reply"))
 			}
 			return
