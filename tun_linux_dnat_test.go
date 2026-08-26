@@ -178,28 +178,21 @@ func TestEnsureSrcValidMarkWithStrictRPFilter(t *testing.T) {
 	confPath := createIPv4Conf(t, "1", "0", "0")
 	testLogger := &warningRecorder{Logger: logger.NOP()}
 
-	state, err := enableSrcValidMark(confPath, testLogger)
+	err := enableSrcValidMark(confPath, testLogger)
 	require.NoError(t, err)
-	require.NotNil(t, state)
 	value, err := os.ReadFile(confPath + "/all/src_valid_mark")
 	require.NoError(t, err)
 	require.Equal(t, "1", string(value))
 	require.Len(t, testLogger.warnings, 1)
-	require.True(t, strings.Contains(testLogger.warnings[0], "will restore it on close"))
-
-	require.NoError(t, state.Close())
-	value, err = os.ReadFile(confPath + "/all/src_valid_mark")
-	require.NoError(t, err)
-	require.Equal(t, "0", string(value))
+	require.True(t, strings.Contains(testLogger.warnings[0], "will remain enabled after close"))
 }
 
 func TestEnsureSrcValidMarkSkipsNonStrictRPFilter(t *testing.T) {
 	confPath := createIPv4Conf(t, "0", "0", "2")
 	require.NoError(t, os.Remove(confPath+"/all/src_valid_mark"))
 
-	state, err := enableSrcValidMark(confPath, logger.NOP())
+	err := enableSrcValidMark(confPath, logger.NOP())
 	require.NoError(t, err)
-	require.Nil(t, state)
 	_, err = os.Stat(confPath + "/all/src_valid_mark")
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
@@ -208,29 +201,25 @@ func TestEnsureSrcValidMarkPreservesEnabledValue(t *testing.T) {
 	confPath := createIPv4Conf(t, "1", "0", "0")
 	require.NoError(t, os.WriteFile(confPath+"/all/src_valid_mark", []byte("1"), 0o600))
 
-	state, err := enableSrcValidMark(confPath, logger.NOP())
+	err := enableSrcValidMark(confPath, logger.NOP())
 	require.NoError(t, err)
-	require.Nil(t, state)
 	value, err := os.ReadFile(confPath + "/all/src_valid_mark")
 	require.NoError(t, err)
 	require.Equal(t, "1", string(value))
 }
 
-func TestEnsureSrcValidMarkAllowsConcurrentBypass(t *testing.T) {
+func TestEnsureSrcValidMarkIsIdempotent(t *testing.T) {
 	confPath := createIPv4Conf(t, "1", "0", "0")
 
-	firstState, err := enableSrcValidMark(confPath, logger.NOP())
+	err := enableSrcValidMark(confPath, logger.NOP())
 	require.NoError(t, err)
-	require.NotNil(t, firstState)
 
-	secondState, err := enableSrcValidMark(confPath, logger.NOP())
+	err = enableSrcValidMark(confPath, logger.NOP())
 	require.NoError(t, err)
-	require.Nil(t, secondState)
 
-	require.NoError(t, firstState.Close())
 	value, err := os.ReadFile(confPath + "/all/src_valid_mark")
 	require.NoError(t, err)
-	require.Equal(t, "0", string(value))
+	require.Equal(t, "1", string(value))
 }
 
 func createIPv4Conf(t *testing.T, allRPFilter string, defaultRPFilter string, interfaceRPFilter string) string {
@@ -300,7 +289,7 @@ func TestAutoRouteDNATBypassNFTables(t *testing.T) {
 	require.NoError(t, bypass.Close())
 	afterCloseSrcValidMark, err := os.ReadFile(srcValidMarkPath)
 	require.NoError(t, err)
-	require.Equal(t, string(bytes.TrimSpace(originalSrcValidMark)), string(bytes.TrimSpace(afterCloseSrcValidMark)))
+	require.Equal(t, string(bytes.TrimSpace(currentSrcValidMark)), string(bytes.TrimSpace(afterCloseSrcValidMark)))
 
 	nft, err := nftables.New()
 	require.NoError(t, err)
