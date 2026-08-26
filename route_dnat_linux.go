@@ -35,11 +35,6 @@ type autoRouteDNATBypass struct {
 	useNFTables   bool
 	iptablesPath  string
 	ip6tablesPath string
-	srcValidMark  *srcValidMarkState
-}
-
-type srcValidMarkState struct {
-	path string
 }
 
 func (t *NativeTun) enableAutoRouteDNATBypass(
@@ -123,7 +118,7 @@ func (o *Options) autoRouteDNATBypassMask() uint32 {
 func (b *autoRouteDNATBypass) Start() error {
 	var err error
 	if len(b.options.Inet4Address) > 0 {
-		b.srcValidMark, err = enableSrcValidMark(ipv4ConfPath, b.options.Logger)
+		err = enableSrcValidMark(ipv4ConfPath, b.options.Logger)
 		if err != nil {
 			return E.Cause(err, "enable src_valid_mark for auto-route DNAT bypass")
 		}
@@ -147,60 +142,37 @@ func (b *autoRouteDNATBypass) Close() error {
 	} else {
 		b.cleanupIPTables()
 	}
-	if b.srcValidMark == nil {
-		return nil
-	}
-	err := b.srcValidMark.Close()
-	b.srcValidMark = nil
-	return err
+	return nil
 }
 
-func enableSrcValidMark(confPath string, log logger.Logger) (*srcValidMarkState, error) {
+func enableSrcValidMark(confPath string, log logger.Logger) error {
 	strictRPFilter, err := hasStrictRPFilter(confPath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if !strictRPFilter {
-		return nil, nil
+		return nil
 	}
 	path := filepath.Join(confPath, "all", "src_valid_mark")
 	value, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	value = bytes.TrimSpace(value)
 	if bytes.Equal(value, []byte("1")) {
-		return nil, nil
+		return nil
 	}
 	if !bytes.Equal(value, []byte("0")) {
-		return nil, E.New("invalid src_valid_mark value: ", string(value))
+		return E.New("invalid src_valid_mark value: ", string(value))
 	}
 	err = os.WriteFile(path, []byte("1"), 0)
 	if err != nil {
-		return nil, err
-	}
-	if log != nil {
-		log.Warn("changed net.ipv4.conf.all.src_valid_mark from 0 to 1 for auto-route DNAT bypass; will restore it on close")
-	}
-	return &srcValidMarkState{
-		path: path,
-	}, nil
-}
-
-func (s *srcValidMarkState) Close() error {
-	if s == nil || s.path == "" {
-		return nil
-	}
-	path := s.path
-	s.path = ""
-	value, err := os.ReadFile(path)
-	if err != nil {
 		return err
 	}
-	if !bytes.Equal(bytes.TrimSpace(value), []byte("1")) {
-		return nil
+	if log != nil {
+		log.Warn("changed net.ipv4.conf.all.src_valid_mark from 0 to 1 for auto-route DNAT bypass; will remain enabled after close")
 	}
-	return os.WriteFile(path, []byte("0"), 0)
+	return nil
 }
 
 func hasStrictRPFilter(confPath string) (bool, error) {
