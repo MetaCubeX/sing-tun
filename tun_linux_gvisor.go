@@ -88,7 +88,7 @@ func (t *NativeTun) WritePacket(pkt *stack.PacketBuffer) (int, error) {
 func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error) {
 	if t.vnetHdr {
 		ep, err := fdbased.New(&fdbased.Options{
-			ProcessorsPerChannel: 1,
+			ProcessorsPerChannel: t.options.EXP_ProcessorsPerChannel,
 			FDs:                  []int{t.tunFd},
 			MTU:                  t.options.MTU,
 			GSOMaxSize:           gsoMaxSize,
@@ -102,7 +102,7 @@ func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error) 
 		return ep, stack.NICOptions{}, nil
 	}
 	ep, err := fdbased.New(&fdbased.Options{
-		ProcessorsPerChannel: 1,
+		ProcessorsPerChannel: t.options.EXP_ProcessorsPerChannel,
 		FDs:                  []int{t.tunFd},
 		MTU:                  t.options.MTU,
 		RXChecksumOffload:    true,

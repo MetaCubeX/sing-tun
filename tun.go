@@ -119,6 +119,9 @@ type Options struct {
 	// For darwin tun
 	EXP_RecvMsgX bool
 	EXP_SendMsgX bool
+
+	// For gvisor
+	EXP_ProcessorsPerChannel int
 }
 
 func (o *Options) Inet4GatewayAddr() netip.Addr {
