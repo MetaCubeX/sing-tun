@@ -79,16 +79,22 @@ func (f *TCPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pac
 
 func (f *TCPForwarder) Forward(r *tcp.ForwarderRequest) {
 	var wq waiter.Queue
-	handshakeCtx, cancel := context.WithCancel(context.Background())
-	go func() {
-		select {
-		case <-f.ctx.Done():
-			wq.Notify(wq.Events())
-		case <-handshakeCtx.Done():
-		}
-	}()
+	var cancel context.CancelFunc
+	if parentDone := f.ctx.Done(); parentDone != nil {
+		var handshakeCtx context.Context
+		handshakeCtx, cancel = context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-parentDone:
+				wq.Notify(wq.Events())
+			case <-handshakeCtx.Done():
+			}
+		}()
+	}
 	endpoint, err := r.CreateEndpoint(&wq)
-	cancel()
+	if cancel != nil {
+		cancel()
+	}
 	if err != nil {
 		r.Complete(true)
 		return
