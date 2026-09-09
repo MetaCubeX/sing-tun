@@ -110,6 +110,14 @@ type Options struct {
 	FileDescriptor                        int
 	Logger                                logger.Logger
 
+	// FreeBSDInterfaceDescription, when non-empty, is written to the tun(4)
+	// interface's description field (ifconfig description) on FreeBSD. FreeBSD
+	// preserves this description after the owning process exits, so the caller
+	// can use it as a marker to identify and clean up tun devices it created.
+	// sing-tun itself attaches no meaning to the value; the caller (e.g. mihomo)
+	// owns both the marker string and any cleanup logic. Ignored on other platforms.
+	FreeBSDInterfaceDescription string
+
 	// No work for TCP, do not use.
 	_TXChecksumOffload bool
 
