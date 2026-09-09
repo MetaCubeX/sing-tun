@@ -43,6 +43,8 @@ const (
 	FWPM_SESSION_FLAG_DYNAMIC uint32 = 0x00000001
 )
 
+const FWP_CONDITION_FLAG_IS_LOOPBACK uint32 = 0x00000001
+
 const (
 	FWP_MATCH_EQUAL                  uint32 = 0
 	FWP_MATCH_GREATER                       = (FWP_MATCH_EQUAL + 1)
@@ -88,6 +90,13 @@ const (
 	FWP_RANGE_TYPE                           = (FWP_V6_ADDR_MASK + 1)
 	FWP_DATA_TYPE_MAX                        = (FWP_RANGE_TYPE + 1)
 )
+
+var FWPM_CONDITION_FLAGS = windows.GUID{
+	Data1: 0x632ce23b,
+	Data2: 0x5167,
+	Data3: 0x435c,
+	Data4: [8]byte{0x86, 0xd7, 0xe9, 0x03, 0x68, 0x4a, 0xa8, 0x0c},
+}
 
 var FWPM_CONDITION_IP_PROTOCOL = windows.GUID{
 	Data1: 0x3971ef2b,

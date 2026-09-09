@@ -265,7 +265,17 @@ func (t *NativeTun) configure() error {
 		}*/
 
 		if len(t.options.Inet6Address) == 0 {
+			// Block IPv6 egress without disrupting local services. Exclude
+			// loopback here rather than overriding other filters with a permit.
+			blockCondition := winsys.FWPM_FILTER_CONDITION0{}
+			blockCondition.FieldKey = winsys.FWPM_CONDITION_FLAGS
+			blockCondition.MatchType = winsys.FWP_MATCH_FLAGS_NONE_SET
+			blockCondition.ConditionValue.Type = winsys.FWP_UINT32
+			blockCondition.ConditionValue.Value = uintptr(winsys.FWP_CONDITION_FLAG_IS_LOOPBACK)
+
 			blockFilter := winsys.FWPM_FILTER0{}
+			blockFilter.FilterCondition = &blockCondition
+			blockFilter.NumFilterConditions = 1
 			blockFilter.DisplayData = winsys.CreateDisplayData(TunnelType, "block ipv6")
 			blockFilter.SubLayerKey = subLayerKey
 			blockFilter.LayerKey = winsys.FWPM_LAYER_ALE_AUTH_CONNECT_V6
