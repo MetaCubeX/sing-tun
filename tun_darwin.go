@@ -444,5 +444,5 @@ func addRoute(destination netip.Prefix, gateway netip.Addr) error {
 }
 
 func flushDNSCache() {
-	shell.Exec("dscacheutil", "-flushcache").Start()
+	_ = shell.Exec("dscacheutil", "-flushcache").Run()
 }
