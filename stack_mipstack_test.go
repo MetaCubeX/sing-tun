@@ -1,5 +1,3 @@
-//go:build with_mipstack
-
 package tun
 
 import (
@@ -412,6 +410,15 @@ func TestMIPStackICMP(t *testing.T) {
 							want = 1
 						}
 					}
+					if policy == "reset" {
+						code := byte(3)
+						if ipv6 {
+							code = 4
+						}
+						if wire[offset+1] != code {
+							t.Fatalf("incorrect ICMP rejection code: %d", wire[offset+1])
+						}
+					}
 					if wire[offset] != want {
 						t.Fatalf("unexpected ICMP type: %d", wire[offset])
 					}
@@ -429,7 +436,7 @@ func TestMIPStackLifecycleAndOptions(t *testing.T) {
 	defer tun.Close()
 	base := mipTestOptions(tun, &mipTestHandler{})
 	for name, modify := range map[string]func(*StackOptions){
-		"addresses": func(o *StackOptions) { o.TunOptions.Inet4Address = nil; o.TunOptions.Inet6Address = nil },
+		"invalid prefix": func(o *StackOptions) { o.TunOptions.Inet4Address = []netip.Prefix{{}} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			o := base
@@ -511,6 +518,9 @@ func TestMIPStackICMPDirectRoute(t *testing.T) {
 			request := mipTestPacket(src, dst, protocol, []byte{echoType, 0, 0, 0, 0, 1, 0, 2, 'a'})
 			tun.in <- request
 			writer := mipReceive(t, writers)
+			if r := writer.(*mipICMPBackWriter).responder; len(r.IPPacket()) != 0 || len(r.Message().Payload) != 0 {
+				t.Fatal("cached ICMP writer retained input packet")
+			}
 			packet := mipReceive(t, route.packets)
 			defer packet.Release()
 			// Reuse the route and overwrite the input buffer, retaining the first

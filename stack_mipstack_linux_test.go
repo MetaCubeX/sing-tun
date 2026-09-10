@@ -1,4 +1,4 @@
-//go:build linux && with_mipstack
+//go:build linux
 
 package tun
 

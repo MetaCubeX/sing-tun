@@ -1,5 +1,3 @@
-//go:build with_mipstack
-
 package tun
 
 import (
@@ -371,5 +369,22 @@ func TestMIPStackSegmentOverflow(t *testing.T) {
 	tun.input <- mipOffloadInput{packet: mipTestPacket(src, dst, 17, udp)}
 	if got := mipReceive(t, payloads); got != "next" {
 		t.Fatalf("traffic after segment overflow: %q", got)
+	}
+}
+
+func (t *mipPlainLinuxTestTun) Read(p []byte) (int, error) {
+	select {
+	case packet := <-t.in:
+		return copy(p, packet), nil
+	case <-t.done:
+		return 0, net.ErrClosed
+	}
+}
+func (t *mipPlainLinuxTestTun) Write(p []byte) (int, error) {
+	select {
+	case t.out <- append([]byte(nil), p...):
+		return len(p), nil
+	case <-t.done:
+		return 0, net.ErrClosed
 	}
 }

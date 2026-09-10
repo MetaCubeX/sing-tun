@@ -1,5 +1,3 @@
-//go:build with_mipstack
-
 package tun
 
 import (
@@ -7,22 +5,55 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+
+	"github.com/metacubex/mipstack"
+	E "github.com/metacubex/sing/common/exceptions"
 )
 
 func (s *MIPStack) tunLoop() {
 	defer s.Close()
+	readCapacity := gsoMaxSize
+	if _, darwin := s.tun.(DarwinTUN); darwin && s.recvMsgX {
+		// Darwin batches can contain hundreds of packets. Reserve one MTU
+		// per packet instead of a full GSO buffer (which utun does not need).
+		readCapacity, _ = s.stack.MTU()
+	}
 	buffers := make([][]byte, s.batchSize)
 	sizes := make([]int, len(buffers))
 	for i := range buffers {
 		// GSOSplit also accepts unsegmented packets larger than the MTU.
-		buffers[i] = make([]byte, gsoMaxSize+s.frontHeadroom)
+		buffers[i] = make([]byte, readCapacity+s.frontHeadroom)
 	}
 	inbound := make([][]byte, 0, len(buffers))
 	reflected := make([][]byte, 0, len(buffers))
 	for s.ctx.Err() == nil {
 		var n int
 		var err error
-		if s.batchTun != nil {
+		if win, ok := s.tun.(WinTun); ok {
+			packet, release, readErr := win.ReadPacket()
+			if len(packet) > 0 {
+				n = 1
+				sizes[0] = copy(buffers[0][s.frontHeadroom:], packet)
+			}
+			if release != nil {
+				release()
+			}
+			err = readErr
+		} else if darwin, ok := s.tun.(DarwinTUN); ok && s.recvMsgX {
+			packets, readErr := darwin.BatchRead()
+			for len(buffers) < len(packets) {
+				buffers = append(buffers, make([]byte, readCapacity+s.frontHeadroom))
+				sizes = append(sizes, 0)
+			}
+			for i, packet := range packets {
+				if len(buffers[i]) < packet.Len()+s.frontHeadroom {
+					buffers[i] = make([]byte, packet.Len()+s.frontHeadroom)
+				}
+				sizes[i] = copy(buffers[i][s.frontHeadroom:], packet.Bytes())
+				packet.Release()
+			}
+			n, err = len(packets), readErr
+		} else if s.batchTun != nil {
 			// The TUN consumes virtio metadata and returns complete IP packets,
 			// including checksums completed by GSOSplit when NEEDS_CSUM is set.
 			n, err = s.batchTun.BatchRead(buffers, s.frontHeadroom, sizes)
@@ -58,14 +89,16 @@ func (s *MIPStack) tunLoop() {
 		// Write reflected packets before the next read reuses their storage.
 		if len(reflected) > 0 {
 			if writeErr := s.writePackets(reflected); writeErr != nil {
-				s.logError(writeErr, "reflect TCP loopback")
-				return
+				if s.ioFailed(writeErr, "reflect TCP loopback") {
+					return
+				}
 			}
 		}
 		if len(inbound) > 0 {
 			if _, writeErr := s.stack.Write(inbound, 0); writeErr != nil {
-				s.logError(writeErr, "input packet")
-				return
+				if s.ioFailed(writeErr, "input packet") {
+					return
+				}
 			}
 		}
 		if errors.Is(err, ErrTooManySegments) {
@@ -75,8 +108,12 @@ func (s *MIPStack) tunLoop() {
 			continue
 		}
 		if err != nil {
-			s.logError(err, "read TUN")
-			return
+			if s.ioFailed(err, "read TUN") {
+				return
+			}
+			if _, win := s.tun.(WinTun); win {
+				return
+			}
 		}
 	}
 }
@@ -129,8 +166,9 @@ func (s *MIPStack) packetLoop() {
 		}
 		if n > 0 {
 			if writeErr := s.writePackets(packets[:n]); writeErr != nil {
-				s.logError(writeErr, "write TUN")
-				return
+				if s.ioFailed(writeErr, "write TUN") {
+					return
+				}
 			}
 		}
 		if err != nil {
@@ -155,23 +193,33 @@ func (s *MIPStack) writePackets(packets [][]byte) error {
 		_, err := s.batchTun.BatchWrite(packets, s.frontHeadroom)
 		return err
 	}
+	var result error
 	for _, packet := range packets {
-		if PacketOffset != 0 {
+		if s.frontHeadroom == 4 {
 			family := uint32(2) // Darwin AF_INET / AF_INET6, network byte order.
-			if packet[PacketOffset]>>4 == 6 {
+			if packet[s.frontHeadroom]>>4 == 6 {
 				family = 30
 			}
 			binary.BigEndian.PutUint32(packet, family)
 		}
 		n, err := s.tun.Write(packet)
 		if err != nil {
-			return err
+			if E.IsClosed(err) {
+				return err
+			}
+			result = errors.Join(result, err)
+			continue
+		}
+		if n == 0 {
+			if _, win := s.tun.(WinTun); win {
+				continue
+			}
 		}
 		if n != len(packet) {
-			return io.ErrShortWrite
+			result = errors.Join(result, io.ErrShortWrite)
 		}
 	}
-	return nil
+	return result
 }
 
 // reflectLoopback preserves the existing stack behavior: swap IP addresses
@@ -183,68 +231,43 @@ func (s *MIPStack) reflectLoopback(packet []byte) bool {
 	if len(s.loopback) == 0 || len(packet) == 0 {
 		return false
 	}
-	var source, destination netip.Addr
-	var sourceOffset, addressSize int
-	switch packet[0] >> 4 {
-	case 4:
-		if len(packet) < 20 {
-			return false
-		}
-		headerLen := int(packet[0]&15) * 4
-		totalLen := int(binary.BigEndian.Uint16(packet[2:4]))
-		if headerLen < 20 || totalLen < headerLen || totalLen > len(packet) || packet[9] != 6 {
-			return false
-		}
-		source, _ = netip.AddrFromSlice(packet[12:16])
-		destination, _ = netip.AddrFromSlice(packet[16:20])
-		sourceOffset, addressSize = 12, 4
-	case 6:
-		if len(packet) < 40 {
-			return false
-		}
-		totalLen := 40 + int(binary.BigEndian.Uint16(packet[4:6]))
-		if totalLen > len(packet) || !mipIPv6TCP(packet[:totalLen]) {
-			return false
-		}
-		source, _ = netip.AddrFromSlice(packet[8:24])
-		destination, _ = netip.AddrFromSlice(packet[24:40])
-		sourceOffset, addressSize = 8, 16
-	default:
+	source, destination, ok := mipPacketAddresses(packet)
+	if !ok {
 		return false
 	}
-	if _, ok := s.loopback[destination]; !ok || !source.IsGlobalUnicast() || !destination.IsGlobalUnicast() {
+	if _, match := s.loopback[destination]; !match || !source.IsGlobalUnicast() || !destination.IsGlobalUnicast() {
 		return false
+	}
+	parsed, err := mipstack.ParseIPPacket(packet)
+	if err != nil || !mipValidLoopback(parsed) {
+		return false
+	}
+	sourceOffset, addressSize := 12, 4
+	if destination.Is6() {
+		sourceOffset, addressSize = 8, 16
 	}
 	copy(packet[sourceOffset:sourceOffset+addressSize], destination.AsSlice())
 	copy(packet[sourceOffset+addressSize:sourceOffset+2*addressSize], source.AsSlice())
 	return true
 }
 
-func mipIPv6TCP(packet []byte) bool {
-	next, offset := packet[6], 40
-	for {
-		switch next {
-		case 6:
-			return true
-		case 0, 60: // Hop-by-Hop / Destination Options.
-			if offset+2 > len(packet) {
-				return false
-			}
-			length := (int(packet[offset+1]) + 1) * 8
-			if offset+length > len(packet) {
-				return false
-			}
-			next, offset = packet[offset], offset+length
-		case 44: // Non-initial fragments do not contain a transport header.
-			if offset+8 > len(packet) {
-				return false
-			}
-			if binary.BigEndian.Uint16(packet[offset+2:offset+4])&0xfff8 != 0 {
-				return packet[offset] == 6
-			}
-			next, offset = packet[offset], offset+8
-		default:
-			return false
+// The complete transport checksum is unavailable on non-atomic fragments.
+func mipValidLoopback(parsed mipstack.IPPacket) bool {
+	if fragment, ok := parsed.Fragment(); ok && !fragment.IsAtomic() {
+		if fragment.Offset != 0 {
+			return fragment.Protocol == mipstack.ProtocolTCP
 		}
+		parsed.Protocol, parsed.Payload = fragment.Protocol, fragment.Payload
+		parsed.MoreFragments, parsed.FragmentOffset = false, 0
+		protocol, _, err := parsed.UpperLayer()
+		return err == nil && protocol == mipstack.ProtocolTCP
 	}
+	_, err := parsed.TCPSegment()
+	return err == nil
+}
+
+// Packet loss or a transient device failure is not a stack shutdown.
+func (s *MIPStack) ioFailed(err error, operation string) bool {
+	s.logError(err, operation)
+	return s.ctx.Err() != nil || E.IsClosed(err) || errors.Is(err, io.EOF)
 }

@@ -1,5 +1,3 @@
-//go:build with_mipstack
-
 package tun
 
 import (
@@ -17,8 +15,6 @@ import (
 	M "github.com/metacubex/sing/common/metadata"
 	N "github.com/metacubex/sing/common/network"
 )
-
-const WithMIPStack = true
 
 // MIPStack adapts the MIPS userspace IP stack to a TUN and the sing handlers.
 // The caller owns the TUN and must close it to release a blocked TUN read.
@@ -41,6 +37,7 @@ type MIPStack struct {
 	loopback           map[netip.Addr]struct{}
 	interfaceAddresses map[netip.Addr]struct{}
 	broadcastAddresses map[netip.Addr]struct{}
+	recvMsgX           bool
 }
 
 func NewMIPStack(options StackOptions) (Stack, error) {
@@ -48,7 +45,13 @@ func NewMIPStack(options StackOptions) (Stack, error) {
 		return nil, E.New("mipstack: TUN and handler are required")
 	}
 	var batchTun LinuxTUN
-	frontHeadroom, batchSize := PacketOffset, 1
+	frontHeadroom, batchSize := 0, 1
+	if _, ok := options.Tun.(DarwinTUN); ok {
+		frontHeadroom = 4
+	}
+	if _, ok := options.Tun.(WinTun); ok {
+		frontHeadroom = 0
+	}
 	if tun, ok := options.Tun.(LinuxTUN); ok {
 		if tun.BatchSize() < 1 || tun.FrontHeadroom() < 0 {
 			return nil, E.New("mipstack: invalid TUN batch size or headroom")
@@ -70,24 +73,18 @@ func NewMIPStack(options StackOptions) (Stack, error) {
 			KeepAliveConfig: mipstack.KeepAliveConfig{Idle: 15 * time.Second, Interval: 15 * time.Second},
 		},
 	}
-	ipStack, err := mipstack.New(config)
-	if err != nil {
-		return nil, err
-	}
-	// TUN interface addresses belong to the host, not this transparent
-	// endpoint. Registering them as MIPS local addresses sends replies to
-	// host-originated traffic into MIPS's internal loopback instead of Read.
-	// MIPS requires a local address per enabled family. Give it only internal
-	// loopback addresses; forwarders still reply from the intercepted target.
-	// New above validates the original address/MTU configuration first.
+	// Interface addresses belong to the host. MIPS owns only private loopback
+	// addresses, so replies to host-originated traffic return through the TUN.
 	interfaceAddresses := make(map[netip.Addr]struct{}, len(addresses))
 	broadcastAddresses := make(map[netip.Addr]struct{})
-	var have4, have6 bool
+	have6 := len(options.TunOptions.Inet6Address) > 0
 	for _, prefix := range addresses {
+		if !prefix.IsValid() {
+			return nil, E.New("mipstack: invalid interface prefix")
+		}
 		address := prefix.Addr().Unmap()
 		interfaceAddresses[address] = struct{}{}
 		if address.Is4() {
-			have4 = true
 			if prefix.Addr().Is4() && prefix.Bits() <= 30 {
 				broadcastAddresses[BroadcastAddr([]netip.Prefix{prefix})] = struct{}{}
 			}
@@ -95,15 +92,12 @@ func NewMIPStack(options StackOptions) (Stack, error) {
 			have6 = true
 		}
 	}
-	config.LocalAddresses = nil
-	if have4 {
-		config.LocalAddresses = append(config.LocalAddresses, netip.MustParsePrefix("127.0.0.1/32"))
-	}
-	if have6 {
+	config.LocalAddresses = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+	if have6 || config.MTU == 0 || config.MTU >= 1280 {
 		config.LocalAddresses = append(config.LocalAddresses, netip.MustParsePrefix("::1/128"))
 	}
-	if err = ipStack.UpdateConfig(config); err != nil {
-		ipStack.Close()
+	ipStack, err := mipstack.New(config)
+	if err != nil {
 		return nil, err
 	}
 	ctx := options.Context
@@ -115,7 +109,7 @@ func NewMIPStack(options StackOptions) (Stack, error) {
 		handler: options.Handler, logger: options.Logger, mapping: NewDirectRouteMapping(options.ICMPTimeout),
 		batchTun: batchTun, frontHeadroom: frontHeadroom, batchSize: batchSize,
 		loopback:           make(map[netip.Addr]struct{}),
-		interfaceAddresses: interfaceAddresses, broadcastAddresses: broadcastAddresses}
+		interfaceAddresses: interfaceAddresses, broadcastAddresses: broadcastAddresses, recvMsgX: options.TunOptions.EXP_RecvMsgX}
 	for _, address := range options.TunOptions.Inet4LoopbackAddress {
 		s.loopback[address.Unmap()] = struct{}{}
 	}
@@ -127,6 +121,9 @@ func NewMIPStack(options StackOptions) (Stack, error) {
 	}
 	if err == nil {
 		_, err = mipstack.NewICMPForwarder(ipStack, mipstack.ICMPForwarderOptions{}, s.forwardICMP)
+	}
+	if err == nil {
+		_, err = mipstack.NewIPForwarder(ipStack, mipstack.IPForwarderOptions{}, func(r *mipstack.IPForwarderRequest) { _ = r.Reject() })
 	}
 	if err != nil {
 		cancel()
@@ -238,7 +235,8 @@ func (s *MIPStack) forwardICMP(request *mipstack.ICMPForwarderRequest) {
 		return
 	}
 	// The route may retain its back writer after this callback has returned.
-	responder, err := request.Detach()
+	packet := request.IPPacket()
+	responder, err := request.DetachForReplies()
 	if err != nil {
 		return
 	}
@@ -248,20 +246,32 @@ func (s *MIPStack) forwardICMP(request *mipstack.ICMPForwarderRequest) {
 		return
 	}
 	action, err := s.mapping.Lookup(DirectRouteSession{Source: message.Source, Destination: message.Destination}, func(timeout time.Duration) (DirectRouteDestination, error) {
-		return s.handler.PrepareConnection(N.NetworkICMP,
+		destination, err := s.handler.PrepareConnection(N.NetworkICMP,
 			M.SocksaddrFrom(message.Source, 0), M.SocksaddrFrom(message.Destination, 0),
 			&mipICMPBackWriter{responder}, timeout)
+		if err != nil && destination != nil {
+			_ = destination.Close()
+			destination = nil
+		}
+		return destination, err
 	})
 	switch {
 	case errors.Is(err, ErrReset):
-		s.logError(responder.Reject(), "reject ICMP")
+		s.replyICMPReset(responder, message, packet)
 	case errors.Is(err, ErrDrop):
-		responder.Drop()
+		return
 	case action != nil:
-		packet := buf.As(responder.IPPacket()).ToOwned()
-		s.logError(action.WritePacket(packet), "forward ICMP")
+		owned := buf.As(packet).ToOwned()
+		s.logError(action.WritePacket(owned), "forward ICMP")
 	default:
-		s.logError(responder.ReplyEcho(), "reply ICMP")
+		reply, err := (mipstack.ICMPMessage{Source: message.Source, Destination: message.Destination, Type: message.Type, Code: message.Code, Body: message.Payload[4:]}).EchoReply(message.Destination)
+		if err != nil {
+			return
+		}
+		payload, err := reply.MarshalBinary()
+		if err == nil {
+			s.logError(responder.Reply(payload), "reply ICMP")
+		}
 	}
 }
 
@@ -271,4 +281,27 @@ type mipICMPBackWriter struct {
 
 func (w *mipICMPBackWriter) WritePacket(packet []byte) error {
 	return w.responder.ReplyIPPacket(packet)
+}
+
+// Match gVisor's ErrReset response rather than MIPS's administrative rejection.
+func (s *MIPStack) replyICMPReset(r *mipstack.ICMPForwarderResponder, m mipstack.ICMPForwarderMessage, quote []byte) {
+	mtu, _ := s.stack.MTU()
+	limit, overhead, kind, code := 576, 28, byte(3), byte(3)
+	if m.Source.Is6() {
+		limit, overhead, kind, code = 1280, 48, 1, 4
+	}
+	if mtu < limit {
+		limit = mtu
+	}
+	if len(quote) > limit-overhead {
+		quote = quote[:limit-overhead]
+	}
+	reply, err := (mipstack.ICMPError{Reporter: m.Destination, Type: kind, Code: code, QuotedPacket: quote}).ICMPMessage(m.Source)
+	if err != nil {
+		return
+	}
+	payload, err := reply.MarshalBinary()
+	if err == nil {
+		s.logError(r.Reply(payload), "reject ICMP")
+	}
 }

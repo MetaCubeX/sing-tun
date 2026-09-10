@@ -1,4 +1,4 @@
-//go:build darwin && with_mipstack
+//go:build darwin
 
 package tun
 
@@ -127,3 +127,7 @@ func TestMIPStackDarwinInterfaceSourceFD(t *testing.T) {
 		})
 	}
 }
+
+// Model utun framing by capability, not by the host running the generic tests.
+func (t *mipTestTun) BatchRead() ([]*buf.Buffer, error) { panic("unexpected batch read") }
+func (t *mipTestTun) BatchWrite([]*buf.Buffer) error    { panic("unexpected batch write") }
