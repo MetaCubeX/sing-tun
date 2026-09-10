@@ -67,17 +67,12 @@ func (s *Mipstack) config() mipstack.Config {
 	if s.mtu >= 1280 || s.inet6Address.IsValid() {
 		addresses = append(addresses, netip.MustParsePrefix("::1/128"))
 	}
-	bufSize := 20 * 1024
 	return mipstack.Config{
 		LocalAddresses: addresses,
 		Promiscuous:    true,
 		MTU:            s.mtu,
 		TCP: mipstack.TCPSocketDefaults{
-			ReceiveBuffer:        bufSize,
-			MaximumReceiveBuffer: bufSize,
-			SendBuffer:           bufSize,
-			MaximumSendBuffer:    bufSize,
-			KeepAlive:            true,
+			KeepAlive: true,
 			KeepAliveConfig: mipstack.KeepAliveConfig{
 				Idle:     15 * time.Second,
 				Interval: 15 * time.Second,
