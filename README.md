@@ -4,6 +4,18 @@ Simple transparent proxy library.
 
 For Linux, Windows, macOS and iOS.
 
+## Optional mipstack backend
+
+Build with `-tags with_mipstack` to enable the pure-Go
+[mipstack](https://github.com/MetaCubeX/mipstack) backend, then select it with
+`NewStack("mipstack", options)` (or call `NewMIPStack(options)` directly).
+Call `Start()` on the returned stack after construction. Without the build tag,
+selecting this backend returns `ErrMIPStackNotIncluded`.
+
+The tag can be combined with `with_gvisor`; the default stack selection and the
+existing `system`, `gvisor`, and `mixed` modes are unchanged.
+
+
 ## License
 
 ```

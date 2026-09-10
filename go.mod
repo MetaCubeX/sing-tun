@@ -7,6 +7,7 @@ require (
 	github.com/google/btree v1.1.3
 	github.com/metacubex/fswatch v0.1.1
 	github.com/metacubex/gvisor v0.0.0-20260807021258-5683e078dbc4
+	github.com/metacubex/mipstack v0.0.0-20260902082959-c7e60ae7a02a
 	github.com/metacubex/nftables v0.0.0-20260426003805-208c2c1ba2cb
 	github.com/metacubex/sing v0.5.7
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a
