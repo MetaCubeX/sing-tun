@@ -205,6 +205,9 @@ func TestMIPStackExternalAddressConfiguration(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { d.Close(); s.Close() })
+				if addresses := s.(*MIPStack).stack.LocalAddresses(); len(addresses) != 0 {
+					t.Fatalf("promiscuous stack owns local addresses: %v", addresses)
+				}
 				if err = s.Start(); err != nil {
 					t.Fatal(err)
 				}
@@ -218,6 +221,9 @@ func TestMIPStackExternalAddressConfiguration(t *testing.T) {
 				p := mipReceive(t, d.device.out)
 				if string(p[offset+8:]) != "test" {
 					t.Fatal("family not available")
+				}
+				if s.(*MIPStack).stack.Stats().LoopbackPackets != 0 {
+					t.Fatal("host traffic entered stack loopback")
 				}
 			})
 		}
@@ -285,7 +291,129 @@ func TestMIPStackICMPFailedRouteCleanup(t *testing.T) {
 	if _, err = stack.(*MIPStack).stack.Write([][]byte{packet}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if !route.IsClosed() {
-		t.Fatal("failed PrepareConnection leaked route")
+	mipWaitRouteClosed(t, route)
+}
+
+func mipWaitRouteClosed(t *testing.T, route *mipTestRoute) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for !route.IsClosed() {
+		select {
+		case <-deadline.C:
+			t.Fatal("ICMP route was not released")
+		case <-tick.C:
+		}
+	}
+}
+
+func TestMIPStackICMPBlockedPrepare(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	route := &mipTestRoute{packets: make(chan *buf.Buffer, 1)}
+	d := newMIPRawDevice()
+	stack, err := NewMIPStack(mipTestOptions(d, &mipTestHandler{icmp: func(string, M.Socksaddr, M.Socksaddr, DirectRouteContext, time.Duration) (DirectRouteDestination, error) {
+		close(entered)
+		<-release
+		return route, nil
+	}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	s := stack.(*MIPStack)
+	packet := mipTestPacket(netip.MustParseAddr("172.19.0.1"), netip.MustParseAddr("198.51.100.10"), 1, []byte{8, 0, 0, 0, 0, 1, 0, 2})
+	returned := make(chan error, 1)
+	go func() { _, err := s.stack.Write([][]byte{packet}, 0); returned <- err }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("PrepareConnection not called")
+	}
+	select {
+	case err := <-returned:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ICMP callback blocked on PrepareConnection")
+	}
+	// Saturate the queue while the worker is blocked; input must still return.
+	for i := 0; i < cap(s.icmpQueue)+1; i++ {
+		go func() { _, err := s.stack.Write([][]byte{packet}, 0); returned <- err }()
+		select {
+		case err := <-returned:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("full ICMP queue blocked input")
+		}
+	}
+	closed := make(chan struct{})
+	go func() { s.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked on PrepareConnection")
+	}
+	// Release via a separate channel value so the deferred close remains safe.
+	release <- struct{}{}
+	mipWaitRouteClosed(t, route)
+	select {
+	case p := <-route.packets:
+		p.Release()
+		t.Fatal("packet forwarded after shutdown")
+	default:
+	}
+}
+
+func TestMIPStackICMPAsyncPacketOwnership(t *testing.T) {
+	for _, ipv6 := range []bool{false, true} {
+		t.Run(map[bool]string{false: "IPv4", true: "IPv6"}[ipv6], func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			defer close(release)
+			d := newMIPRawDevice()
+			s, err := NewMIPStack(mipTestOptions(d, &mipTestHandler{icmp: func(string, M.Socksaddr, M.Socksaddr, DirectRouteContext, time.Duration) (DirectRouteDestination, error) {
+				close(entered)
+				<-release
+				return nil, nil
+			}}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.Close()
+			defer s.Close()
+			if err = s.Start(); err != nil {
+				t.Fatal(err)
+			}
+			src, dst, protocol, kind, offset := netip.MustParseAddr("172.19.0.1"), netip.MustParseAddr("198.51.100.10"), byte(1), byte(8), 20
+			if ipv6 {
+				src, dst, protocol, kind, offset = netip.MustParseAddr("fd00::1"), netip.MustParseAddr("2001:db8::10"), 58, 128, 40
+			}
+			packet := mipTestPacket(src, dst, protocol, []byte{kind, 0, 0, 0, 0, 1, 0, 2, 't', 'e', 's', 't'})
+			if _, err = s.(*MIPStack).stack.Write([][]byte{packet}, 0); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("PrepareConnection not called")
+			}
+			for i := range packet {
+				packet[i] = 0
+			}
+			release <- struct{}{}
+			reply := mipReceive(t, d.device.out)
+			if string(reply[offset+8:]) != "test" {
+				t.Fatal("async reply used borrowed packet storage")
+			}
+		})
 	}
 }

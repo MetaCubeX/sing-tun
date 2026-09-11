@@ -29,7 +29,7 @@ type MIPStack struct {
 	mu                 sync.Mutex
 	started            bool
 	closed             bool
-	icmpMu             sync.Mutex
+	icmpQueue          chan func()
 	writeMu            sync.Mutex
 	batchTun           LinuxTUN
 	frontHeadroom      int
@@ -65,16 +65,15 @@ func NewMIPStack(options StackOptions) (Stack, error) {
 	addresses := append([]netip.Prefix(nil), options.TunOptions.Inet4Address...)
 	addresses = append(addresses, options.TunOptions.Inet6Address...)
 	config := mipstack.Config{
-		LocalAddresses: addresses,
-		MTU:            options.TunOptions.MTU,
-		Promiscuous:    true,
+		MTU:         options.TunOptions.MTU,
+		Promiscuous: true,
 		TCP: mipstack.TCPSocketDefaults{
 			KeepAlive:       true,
 			KeepAliveConfig: mipstack.KeepAliveConfig{Idle: 15 * time.Second, Interval: 15 * time.Second},
 		},
 	}
-	// Interface addresses belong to the host. MIPS owns only private loopback
-	// addresses, so replies to host-originated traffic return through the TUN.
+	// Interface addresses belong to the host, not the stack. Addressless
+	// promiscuous mode sends replies to host-originated traffic through the TUN.
 	interfaceAddresses := make(map[netip.Addr]struct{}, len(addresses))
 	broadcastAddresses := make(map[netip.Addr]struct{})
 	have6 := len(options.TunOptions.Inet6Address) > 0
@@ -92,9 +91,9 @@ func NewMIPStack(options StackOptions) (Stack, error) {
 			have6 = true
 		}
 	}
-	config.LocalAddresses = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
-	if have6 || config.MTU == 0 || config.MTU >= 1280 {
-		config.LocalAddresses = append(config.LocalAddresses, netip.MustParsePrefix("::1/128"))
+	if !have6 && config.MTU > 0 && config.MTU < 1280 {
+		// Default routes include both families; IPv6 requires an MTU of 1280.
+		config.Routes = []mipstack.Route{{Destination: netip.PrefixFrom(netip.IPv4Unspecified(), 0)}}
 	}
 	ipStack, err := mipstack.New(config)
 	if err != nil {
@@ -109,7 +108,7 @@ func NewMIPStack(options StackOptions) (Stack, error) {
 		handler: options.Handler, logger: options.Logger, mapping: NewDirectRouteMapping(options.ICMPTimeout),
 		batchTun: batchTun, frontHeadroom: frontHeadroom, batchSize: batchSize,
 		loopback:           make(map[netip.Addr]struct{}),
-		interfaceAddresses: interfaceAddresses, broadcastAddresses: broadcastAddresses, recvMsgX: options.TunOptions.EXP_RecvMsgX}
+		interfaceAddresses: interfaceAddresses, broadcastAddresses: broadcastAddresses, recvMsgX: options.TunOptions.EXP_RecvMsgX, icmpQueue: make(chan func(), 64)}
 	for _, address := range options.TunOptions.Inet4LoopbackAddress {
 		s.loopback[address.Unmap()] = struct{}{}
 	}
@@ -130,6 +129,7 @@ func NewMIPStack(options StackOptions) (Stack, error) {
 		ipStack.Close()
 		return nil, err
 	}
+	go s.icmpLoop()
 	return s, nil
 }
 
@@ -165,9 +165,6 @@ func (s *MIPStack) Close() error {
 	s.cancel()
 	err := s.stack.Close()
 	s.mu.Unlock()
-	s.icmpMu.Lock()
-	s.mapping.status.Clear()
-	s.icmpMu.Unlock()
 	return err
 }
 
@@ -235,13 +232,38 @@ func (s *MIPStack) forwardICMP(request *mipstack.ICMPForwarderRequest) {
 		return
 	}
 	// The route may retain its back writer after this callback has returned.
-	packet := request.IPPacket()
+	packet := append([]byte(nil), request.IPPacket()...)
+	message.Payload = append([]byte(nil), message.Payload...)
 	responder, err := request.DetachForReplies()
 	if err != nil {
 		return
 	}
-	s.icmpMu.Lock()
-	defer s.icmpMu.Unlock()
+	select {
+	case <-s.ctx.Done():
+	case s.icmpQueue <- func() { s.processICMP(responder, message, packet) }:
+	default:
+		// Drop on overload instead of blocking the stack's input path.
+	}
+}
+
+// One bounded queue keeps slow application handlers off the input path.
+// The worker owns cache cleanup, including routes created after cancellation.
+func (s *MIPStack) icmpLoop() {
+	defer s.mapping.status.Clear()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case task := <-s.icmpQueue:
+			if s.ctx.Err() != nil {
+				return
+			}
+			task()
+		}
+	}
+}
+
+func (s *MIPStack) processICMP(responder *mipstack.ICMPForwarderResponder, message mipstack.ICMPForwarderMessage, packet []byte) {
 	if s.ctx.Err() != nil {
 		return
 	}
@@ -255,6 +277,9 @@ func (s *MIPStack) forwardICMP(request *mipstack.ICMPForwarderRequest) {
 		}
 		return destination, err
 	})
+	if s.ctx.Err() != nil {
+		return
+	}
 	switch {
 	case errors.Is(err, ErrReset):
 		s.replyICMPReset(responder, message, packet)

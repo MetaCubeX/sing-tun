@@ -557,9 +557,7 @@ func TestMIPStackICMPDirectRoute(t *testing.T) {
 				t.Fatalf("incorrect direct ICMP reply: %x", wire)
 			}
 			s.Close()
-			if !route.IsClosed() {
-				t.Fatal("stack close did not release cached route")
-			}
+			mipWaitRouteClosed(t, route)
 			if err := writer.WritePacket(reply); !errors.Is(err, net.ErrClosed) {
 				t.Fatalf("late ICMP write: %v", err)
 			}
