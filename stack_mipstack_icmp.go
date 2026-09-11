@@ -21,11 +21,21 @@ func (s *Mipstack) forwardICMP(request *mips.ICMPForwarderRequest) {
 		_ = request.Drop()
 		return
 	}
-	responder, err := request.Detach()
-	if err != nil {
+	select {
+	case s.icmpSlots <- struct{}{}:
+	default:
+		_ = request.Drop()
 		return
 	}
-	go s.forwardDetachedICMP(responder)
+	responder, err := request.Detach()
+	if err != nil {
+		<-s.icmpSlots
+		return
+	}
+	go func() {
+		defer func() { <-s.icmpSlots }()
+		s.forwardDetachedICMP(responder)
+	}()
 }
 
 func (s *Mipstack) forwardDetachedICMP(responder *mips.ICMPForwarderResponder) {

@@ -134,6 +134,79 @@ func TestICMPPolicy(t *testing.T) {
 	}
 }
 
+func TestICMPAdmissionLimitDoesNotBlockInput(t *testing.T) {
+	d := newMemoryTun()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+	h := &testHandler{prepare: func(DirectRouteContext) (DirectRouteDestination, error) {
+		startOnce.Do(func() { close(started) })
+		<-release
+		return nil, nil
+	}}
+	s := testStack(t, d, h, nil)
+	source := netip.MustParseAddr("198.18.0.2")
+	target := netip.MustParseAddr("8.8.8.8")
+	packet := transportPacket(source, target, 1, []byte{8, 0, 0, 0, 0, 1, 0, 1})
+
+	// The first request blocks in PrepareConnection. Processing well beyond the
+	// admission limit proves packet handling keeps admitting and dropping
+	// packets instead of waiting for preparation.
+	s.processPacket(packet)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("ICMP preparation did not start")
+	}
+	sent := make(chan struct{})
+	go func() {
+		for i := 0; i < 64; i++ {
+			s.processPacket(packet)
+		}
+		close(sent)
+	}()
+	select {
+	case <-sent:
+	case <-time.After(time.Second):
+		t.Fatal("packet input blocked while ICMP preparation was stalled")
+	}
+	deadline := time.After(time.Second)
+	for len(s.icmpSlots) < cap(s.icmpSlots) {
+		select {
+		case <-deadline:
+			t.Fatalf("ICMP admission did not fill: %d/%d", len(s.icmpSlots), cap(s.icmpSlots))
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	close(release)
+	// Exactly the admitted requests produce fallback echo replies. The rest
+	// were dropped at admission.
+	for i := 0; i < cap(s.icmpSlots); i++ {
+		readPacket(t, d)
+	}
+	select {
+	case extra := <-d.out:
+		t.Fatalf("excess ICMP request was not dropped: %x", extra)
+	case <-time.After(100 * time.Millisecond):
+	}
+	deadline = time.After(time.Second)
+	for len(s.icmpSlots) != 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("ICMP admission slots did not drain: %d remaining", len(s.icmpSlots))
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	// Once preparation has completed and the slots drain, a fresh request is
+	// admitted again.
+	s.processPacket(packet)
+	readPacket(t, d)
+}
+
 func TestICMPInterfaceAddressBypassesPolicy(t *testing.T) {
 	for _, family := range []string{"ipv4", "ipv6"} {
 		t.Run(family, func(t *testing.T) {

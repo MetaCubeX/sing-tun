@@ -25,6 +25,7 @@ type Mipstack struct {
 	handler              Handler
 	logger               logger.Logger
 	stack                *mipstack.Stack
+	icmpSlots            chan struct{}
 }
 
 func NewMipstack(options StackOptions) (Stack, error) {
@@ -50,6 +51,7 @@ func NewMipstack(options StackOptions) (Stack, error) {
 		inet6LoopbackAddress: options.TunOptions.Inet6LoopbackAddress,
 		broadcastAddr:        BroadcastAddr(options.TunOptions.Inet4Address),
 		icmpMapping:          NewDirectRouteMapping(options.ICMPTimeout),
+		icmpSlots:            make(chan struct{}, 16),
 		handler:              options.Handler,
 		logger:               options.Logger,
 	}
