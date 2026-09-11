@@ -179,16 +179,16 @@ func TestICMPInterfaceAddressBypassesPolicy(t *testing.T) {
 	}
 }
 
-func TestMipsICMPResetPortUnreachable(t *testing.T) {
+func TestMipsICMPResetAdministrativelyProhibited(t *testing.T) {
 	for _, ipv6 := range []bool{false, true} {
 		t.Run(map[bool]string{false: "ipv4", true: "ipv6"}[ipv6], func(t *testing.T) {
 			d := newMemoryTun()
 			s := testStack(t, d, &testHandler{prepare: func(DirectRouteContext) (DirectRouteDestination, error) { return nil, ErrReset }}, nil)
 			source, target := netip.MustParseAddr("198.18.0.2"), netip.MustParseAddr("8.8.8.8")
-			protocol, kind, code, offset, limit := byte(1), byte(8), byte(3), 20, 576
+			protocol, kind, code, offset, limit := byte(1), byte(8), byte(13), 20, 576
 			if ipv6 {
 				source, target = netip.MustParseAddr("fd00::2"), netip.MustParseAddr("2001:4860::8888")
-				protocol, kind, code, offset, limit = 58, 128, 4, 40, 1280
+				protocol, kind, code, offset, limit = 58, 128, 1, 40, 1280
 			}
 			payload := make([]byte, 1400)
 			payload[0] = kind
@@ -224,6 +224,7 @@ func TestMipsICMPRepliesOnly(t *testing.T) {
 				replyPacket := transportPacket(target, source, protocol, replyPayload)
 				d := newMemoryTun()
 				var writer *mipsICMPWriter
+				prepared := make(chan struct{})
 				burst := func() {
 					results := make(chan error, 4)
 					for i := 0; i < 4; i++ {
@@ -235,8 +236,9 @@ func TestMipsICMPRepliesOnly(t *testing.T) {
 				}
 				s := testStack(t, d, &testHandler{prepare: func(context DirectRouteContext) (DirectRouteDestination, error) {
 					writer = context.(*mipsICMPWriter)
-					require.Nil(t, writer.responder.IPPacket())
-					require.Nil(t, writer.responder.Message().Payload)
+					close(prepared)
+					require.NotNil(t, writer.responder.IPPacket())
+					require.NotNil(t, writer.responder.Message().Payload)
 					if mode == "error" {
 						return nil, errors.New("dial failed")
 					}
@@ -250,6 +252,11 @@ func TestMipsICMPRepliesOnly(t *testing.T) {
 					return destination, nil
 				}}, nil)
 				s.processPacket(input)
+				select {
+				case <-prepared:
+				case <-time.After(time.Second):
+					t.Fatal("ICMP preparation not started")
+				}
 				require.Equal(t, original, input, "borrowed request was modified")
 				for i := range input {
 					input[i] = 0 // Simulate the delivery buffer being reused.
