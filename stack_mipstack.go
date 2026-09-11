@@ -57,20 +57,16 @@ func NewMipstack(options StackOptions) (Stack, error) {
 }
 
 func (s *Mipstack) config() mipstack.Config {
-	// TODO: Make LocalAddresses in mipstack optional in promiscuous mode.
-	// Interface addresses belong to the host. Registering them here would
-	// route replies into MIPS' internal loopback instead of back to the TUN.
-	// Like gVisor, accept both families even for an externally configured TUN.
-	addresses := []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
-	// Keep IPv4-only links below IPv6's minimum MTU usable. Explicit IPv6
-	// configurations below that minimum still fail dependency validation.
-	if s.mtu >= 1280 || s.inet6Address.IsValid() {
-		addresses = append(addresses, netip.MustParsePrefix("::1/128"))
+	// With no local addresses, mipstack's default IPv6 route rejects IPv4-only
+	// links whose MTU is below IPv6's minimum, so install an IPv4 default route.
+	var routes []mipstack.Route
+	if s.mtu != 0 && s.mtu < 1280 && !s.inet6Address.IsValid() {
+		routes = []mipstack.Route{{Destination: netip.MustParsePrefix("0.0.0.0/0")}}
 	}
 	return mipstack.Config{
-		LocalAddresses: addresses,
-		Promiscuous:    true,
-		MTU:            s.mtu,
+		Routes:      routes,
+		Promiscuous: true,
+		MTU:         s.mtu,
 		TCP: mipstack.TCPSocketDefaults{
 			KeepAlive: true,
 			KeepAliveConfig: mipstack.KeepAliveConfig{
