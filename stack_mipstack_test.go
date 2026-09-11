@@ -411,9 +411,9 @@ func TestMIPStackICMP(t *testing.T) {
 						}
 					}
 					if policy == "reset" {
-						code := byte(3)
+						code := byte(13)
 						if ipv6 {
-							code = 4
+							code = 1
 						}
 						if wire[offset+1] != code {
 							t.Fatalf("incorrect ICMP rejection code: %d", wire[offset+1])
@@ -518,8 +518,8 @@ func TestMIPStackICMPDirectRoute(t *testing.T) {
 			request := mipTestPacket(src, dst, protocol, []byte{echoType, 0, 0, 0, 0, 1, 0, 2, 'a'})
 			tun.in <- request
 			writer := mipReceive(t, writers)
-			if r := writer.(*mipICMPBackWriter).responder; len(r.IPPacket()) != 0 || len(r.Message().Payload) != 0 {
-				t.Fatal("cached ICMP writer retained input packet")
+			if r := writer.(*mipICMPBackWriter).responder; !bytes.Equal(r.IPPacket(), request) || len(r.Message().Payload) == 0 {
+				t.Fatal("detached ICMP writer did not retain its packet snapshot")
 			}
 			packet := mipReceive(t, route.packets)
 			defer packet.Release()

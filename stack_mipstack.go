@@ -232,15 +232,13 @@ func (s *MIPStack) forwardICMP(request *mipstack.ICMPForwarderRequest) {
 		return
 	}
 	// The route may retain its back writer after this callback has returned.
-	packet := append([]byte(nil), request.IPPacket()...)
-	message.Payload = append([]byte(nil), message.Payload...)
-	responder, err := request.DetachForReplies()
+	responder, err := request.Detach()
 	if err != nil {
 		return
 	}
 	select {
 	case <-s.ctx.Done():
-	case s.icmpQueue <- func() { s.processICMP(responder, message, packet) }:
+	case s.icmpQueue <- func() { s.processICMP(responder) }:
 	default:
 		// Drop on overload instead of blocking the stack's input path.
 	}
@@ -263,7 +261,8 @@ func (s *MIPStack) icmpLoop() {
 	}
 }
 
-func (s *MIPStack) processICMP(responder *mipstack.ICMPForwarderResponder, message mipstack.ICMPForwarderMessage, packet []byte) {
+func (s *MIPStack) processICMP(responder *mipstack.ICMPForwarderResponder) {
+	message := responder.Message()
 	if s.ctx.Err() != nil {
 		return
 	}
@@ -282,21 +281,14 @@ func (s *MIPStack) processICMP(responder *mipstack.ICMPForwarderResponder, messa
 	}
 	switch {
 	case errors.Is(err, ErrReset):
-		s.replyICMPReset(responder, message, packet)
+		s.logError(responder.Reject(), "reject ICMP")
 	case errors.Is(err, ErrDrop):
 		return
 	case action != nil:
-		owned := buf.As(packet).ToOwned()
+		owned := buf.As(responder.IPPacket()).ToOwned()
 		s.logError(action.WritePacket(owned), "forward ICMP")
 	default:
-		reply, err := (mipstack.ICMPMessage{Source: message.Source, Destination: message.Destination, Type: message.Type, Code: message.Code, Body: message.Payload[4:]}).EchoReply(message.Destination)
-		if err != nil {
-			return
-		}
-		payload, err := reply.MarshalBinary()
-		if err == nil {
-			s.logError(responder.Reply(payload), "reply ICMP")
-		}
+		s.logError(responder.ReplyEcho(), "reply ICMP")
 	}
 }
 
@@ -306,27 +298,4 @@ type mipICMPBackWriter struct {
 
 func (w *mipICMPBackWriter) WritePacket(packet []byte) error {
 	return w.responder.ReplyIPPacket(packet)
-}
-
-// Match gVisor's ErrReset response rather than MIPS's administrative rejection.
-func (s *MIPStack) replyICMPReset(r *mipstack.ICMPForwarderResponder, m mipstack.ICMPForwarderMessage, quote []byte) {
-	mtu, _ := s.stack.MTU()
-	limit, overhead, kind, code := 576, 28, byte(3), byte(3)
-	if m.Source.Is6() {
-		limit, overhead, kind, code = 1280, 48, 1, 4
-	}
-	if mtu < limit {
-		limit = mtu
-	}
-	if len(quote) > limit-overhead {
-		quote = quote[:limit-overhead]
-	}
-	reply, err := (mipstack.ICMPError{Reporter: m.Destination, Type: kind, Code: code, QuotedPacket: quote}).ICMPMessage(m.Source)
-	if err != nil {
-		return
-	}
-	payload, err := reply.MarshalBinary()
-	if err == nil {
-		s.logError(r.Reply(payload), "reject ICMP")
-	}
 }
