@@ -194,9 +194,19 @@ func (m *Mixed) processPacket(packet []byte) bool {
 	)
 	switch ipVersion := header.IPVersion(packet); ipVersion {
 	case header.IPv4Version:
-		writeBack, err = m.processIPv4(packet)
+		ipHdr := header.IPv4(packet)
+		if !ipHdr.IsValid(len(packet)) {
+			err = E.New("ip: invalid IPv4 packet")
+			break
+		}
+		writeBack, err = m.processIPv4(ipHdr)
 	case header.IPv6Version:
-		writeBack, err = m.processIPv6(packet)
+		ipHdr := header.IPv6(packet)
+		if !ipHdr.IsValid(len(packet)) {
+			err = E.New("ip: invalid IPv6 packet")
+			break
+		}
+		writeBack, err = m.processIPv6(ipHdr)
 	default:
 		err = E.New("ip: unknown version: ", ipVersion)
 	}
