@@ -7,6 +7,7 @@ require (
 	github.com/google/btree v1.1.3
 	github.com/metacubex/fswatch v0.1.1
 	github.com/metacubex/gvisor v0.0.0-20260807021258-5683e078dbc4
+	github.com/metacubex/mipstack v0.0.0-20260910230046-ba762df4c91d
 	github.com/metacubex/nftables v0.0.0-20260426003805-208c2c1ba2cb
 	github.com/metacubex/sing v0.5.7
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a
@@ -15,6 +16,7 @@ require (
 	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e
 	golang.org/x/net v0.35.0
 	golang.org/x/sys v0.30.0
+	golang.org/x/time v0.10.0
 )
 
 require (
@@ -27,6 +29,5 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/sync v0.11.0 // indirect
-	golang.org/x/time v0.10.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
