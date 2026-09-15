@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/metacubex/mipstack"
-	"github.com/metacubex/sing-tun/internal/gtcpip/header"
 	E "github.com/metacubex/sing/common/exceptions"
 	"github.com/metacubex/sing/common/logger"
 )
@@ -217,14 +216,18 @@ func (s *Mipstack) batchLoopDarwin(darwinTUN DarwinTUN) {
 // processPacket processes an IP packet beginning at offset. The leading bytes
 // are retained when handing the buffer to mipstack so callers can reuse their
 // existing packet storage without first slicing away device metadata.
+// The caller must provide exclusive, writable access until this call returns.
+// Reflection may rewrite packet in place. Neither writePackets nor stack.Write
+// uses its contents after returning, so read loops may then reuse or release it.
 func (s *Mipstack) processPacket(packet []byte, offset int) {
 	ipPacket := packet[offset:]
-	destination, ok := mipsPacketDestination(ipPacket)
-	if !ok {
+	parsed, err := mipstack.ParseIPPacket(ipPacket)
+	if err != nil {
 		return
 	}
-	// Match sing-tun's LinkEndpointFilter, including reflecting non-unicast
-	// packets unchanged rather than offering them to protocol forwarders.
+	destination := parsed.Destination
+	// Reflect non-unicast packets after IP validation, without offering them
+	// to protocol forwarders.
 	if destination == s.broadcastAddr || !destination.IsGlobalUnicast() {
 		if err := s.writePackets([][]byte{packet}, offset); err != nil {
 			s.logger.Trace(E.Cause(err, "write packet"))
@@ -239,52 +242,27 @@ func (s *Mipstack) processPacket(packet []byte, offset int) {
 		if address != destination {
 			continue
 		}
-		parsed, err := mipstack.ParseIPPacket(ipPacket)
-		if err != nil {
-			return
-		}
 		if !mipsValidLoopbackPacket(parsed) {
 			break
 		}
-		responseOffset := offset
-		response := make([]byte, responseOffset+len(ipPacket))
-		copy(response[responseOffset:], ipPacket)
-		if destination.Is4() {
-			ip := header.IPv4(response[responseOffset:])
-			ip.SetSourceAddr(destination)
-			ip.SetDestinationAddr(parsed.Source)
-		} else {
-			ip := header.IPv6(response[responseOffset:])
-			ip.SetSourceAddr(destination)
-			ip.SetDestinationAddr(parsed.Source)
+		parsed.Source, parsed.Destination = parsed.Destination, parsed.Source
+		// AppendRawBinary supports overlapping input and output. Swapping
+		// addresses does not change the encoded length, so packet has enough
+		// capacity and its payload stays at the same location.
+		_, err := parsed.AppendRawBinary(packet[:offset])
+		if err != nil {
+			return
 		}
-		// Swapping the addresses preserves both the IP checksum and the
-		// TCP pseudo-header sum, also for fragments and extension headers.
-		if err := s.writePackets([][]byte{response}, responseOffset); err != nil {
+		// Keep the original slice length to preserve link-layer padding.
+		// Swapping addresses preserves the TCP pseudo-header sum, including
+		// for fragments; mipstack recalculates the IPv4 header checksum.
+		if err := s.writePackets([][]byte{packet}, offset); err != nil {
 			s.logger.Trace(E.Cause(err, "write packet"))
 		}
 		return
 	}
 	// Invalid packet errors are local to the datagram, not fatal device errors.
 	_, _ = s.stack.Write([][]byte{packet}, offset)
-}
-
-// Inspect only the base header before non-unicast reflection, just as
-// LinkEndpointFilter does. Full protocol validation belongs to mipstack.
-func mipsPacketDestination(packet []byte) (netip.Addr, bool) {
-	switch header.IPVersion(packet) {
-	case header.IPv4Version:
-		ip := header.IPv4(packet)
-		if ip.IsValid(len(packet)) {
-			return ip.DestinationAddr(), true
-		}
-	case header.IPv6Version:
-		ip := header.IPv6(packet)
-		if ip.IsValid(len(packet)) {
-			return ip.DestinationAddr(), true
-		}
-	}
-	return netip.Addr{}, false
 }
 
 // Validate complete packets before bypassing the stack. Fragment checksums
@@ -412,7 +390,7 @@ func (s *Mipstack) writePackets(packets [][]byte, offset int) error {
 			familyHeader[1] = 0
 			familyHeader[2] = 0
 			familyHeader[3] = 2 // AF_INET on Darwin.
-			if header.IPVersion(ipPacket) == header.IPv6Version {
+			if len(ipPacket) > 0 && ipPacket[0]>>4 == 6 {
 				familyHeader[3] = 30 // AF_INET6 on Darwin, even when tested on another OS.
 			}
 			if _, err := darwin.Write(packet[offset-4:]); err != nil {

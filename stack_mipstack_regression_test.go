@@ -281,6 +281,7 @@ func TestMipsLoopbackFragments(t *testing.T) {
 			require.NoError(t, err)
 			require.Greater(t, len(fragments), 1)
 			for _, fragment := range fragments {
+				before := append([]byte(nil), fragment...)
 				s.processPacket(fragment, 0)
 				response := readPacket(t, d)
 				reflected, err := mips.ParseIPPacket(response)
@@ -290,17 +291,19 @@ func TestMipsLoopbackFragments(t *testing.T) {
 				reflected.Source, reflected.Destination = source, target
 				original, err := reflected.MarshalRawBinary()
 				require.NoError(t, err)
-				require.Equal(t, fragment, original)
+				require.Equal(t, before, original)
 			}
 		})
 	}
 }
 
-func TestMipsNonUnicastBeforeChecksumValidation(t *testing.T) {
+func TestMipsNonUnicastChecksumValidation(t *testing.T) {
 	d := newMemoryTun()
 	s := testStack(t, d, &testHandler{}, nil)
 	packet := udpPacket(netip.MustParseAddr("198.18.0.2"), netip.MustParseAddr("224.0.0.1"), 53, []byte("reflect"))
-	packet[10] ^= 1
+	invalid := append([]byte(nil), packet...)
+	invalid[10] ^= 1
+	s.processPacket(invalid, 0)
 	s.processPacket(packet, 0)
 	require.Equal(t, packet, readPacket(t, d))
 }
