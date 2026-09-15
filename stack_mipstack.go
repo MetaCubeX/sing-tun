@@ -148,7 +148,7 @@ func (s *Mipstack) readLoop() {
 	for {
 		n, err := device.Read(buffer)
 		if n > offset {
-			s.processPacket(buffer[offset:n])
+			s.processPacket(buffer[:n], offset)
 		}
 		if err != nil {
 			if E.IsClosed(err) {
@@ -163,7 +163,7 @@ func (s *Mipstack) wintunLoop(winTun WinTun) {
 	for {
 		packet, release, err := winTun.ReadPacket()
 		if len(packet) > 0 {
-			s.processPacket(packet)
+			s.processPacket(packet, 0)
 		}
 		if release != nil {
 			release()
@@ -187,7 +187,7 @@ func (s *Mipstack) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 	for {
 		n, err := linuxTUN.BatchRead(buffers, offset, sizes)
 		for i := 0; i < n; i++ {
-			s.processPacket(buffers[i][offset : offset+sizes[i]])
+			s.processPacket(buffers[i][:offset+sizes[i]], offset)
 		}
 		if err != nil {
 			if E.IsClosed(err) {
@@ -202,7 +202,7 @@ func (s *Mipstack) batchLoopDarwin(darwinTUN DarwinTUN) {
 	for {
 		buffers, err := darwinTUN.BatchRead()
 		for _, buffer := range buffers {
-			s.processPacket(buffer.Bytes())
+			s.processPacket(buffer.Bytes(), 0)
 			buffer.Release()
 		}
 		if err != nil {
@@ -214,15 +214,19 @@ func (s *Mipstack) batchLoopDarwin(darwinTUN DarwinTUN) {
 	}
 }
 
-func (s *Mipstack) processPacket(packet []byte) {
-	destination, ok := mipsPacketDestination(packet)
+// processPacket processes an IP packet beginning at offset. The leading bytes
+// are retained when handing the buffer to mipstack so callers can reuse their
+// existing packet storage without first slicing away device metadata.
+func (s *Mipstack) processPacket(packet []byte, offset int) {
+	ipPacket := packet[offset:]
+	destination, ok := mipsPacketDestination(ipPacket)
 	if !ok {
 		return
 	}
 	// Match sing-tun's LinkEndpointFilter, including reflecting non-unicast
 	// packets unchanged rather than offering them to protocol forwarders.
 	if destination == s.broadcastAddr || !destination.IsGlobalUnicast() {
-		if err := s.writePacket(packet); err != nil {
+		if err := s.writePackets([][]byte{packet}, offset); err != nil {
 			s.logger.Trace(E.Cause(err, "write packet"))
 		}
 		return
@@ -235,32 +239,34 @@ func (s *Mipstack) processPacket(packet []byte) {
 		if address != destination {
 			continue
 		}
-		parsed, err := mipstack.ParseIPPacket(packet)
+		parsed, err := mipstack.ParseIPPacket(ipPacket)
 		if err != nil {
 			return
 		}
 		if !mipsValidLoopbackPacket(parsed) {
 			break
 		}
-		response := append([]byte(nil), packet...)
+		responseOffset := offset
+		response := make([]byte, responseOffset+len(ipPacket))
+		copy(response[responseOffset:], ipPacket)
 		if destination.Is4() {
-			ip := header.IPv4(response)
+			ip := header.IPv4(response[responseOffset:])
 			ip.SetSourceAddr(destination)
 			ip.SetDestinationAddr(parsed.Source)
 		} else {
-			ip := header.IPv6(response)
+			ip := header.IPv6(response[responseOffset:])
 			ip.SetSourceAddr(destination)
 			ip.SetDestinationAddr(parsed.Source)
 		}
 		// Swapping the addresses preserves both the IP checksum and the
 		// TCP pseudo-header sum, also for fragments and extension headers.
-		if err := s.writePacket(response); err != nil {
+		if err := s.writePackets([][]byte{response}, responseOffset); err != nil {
 			s.logger.Trace(E.Cause(err, "write packet"))
 		}
 		return
 	}
 	// Invalid packet errors are local to the datagram, not fatal device errors.
-	_, _ = s.stack.Write([][]byte{packet}, 0)
+	_, _ = s.stack.Write([][]byte{packet}, offset)
 }
 
 // Inspect only the base header before non-unicast reflection, just as
@@ -301,19 +307,32 @@ func mipsValidLoopbackPacket(parsed mipstack.IPPacket) bool {
 }
 
 func (s *Mipstack) writeLoop() {
+	outputOffset := 0
+	bufferSize := int(s.mtu)
+	bufferCapacity := bufferSize
+	// Output buffers include the device header space; Linux GSO buffers also
+	// retain enough capacity for GRO to merge packets without another copy.
+	if linux, ok := s.tun.(LinuxTUN); ok && linux.FrontHeadroom() > 0 {
+		outputOffset = linux.FrontHeadroom()
+		if bufferCapacity < int(gsoMaxSize) {
+			bufferCapacity = int(gsoMaxSize)
+		}
+	} else if _, ok := s.tun.(DarwinTUN); ok {
+		outputOffset = 4
+	}
 	buffers := make([][]byte, s.stack.BatchSize())
 	for i := range buffers {
-		buffers[i] = make([]byte, int(s.mtu))
+		buffers[i] = make([]byte, outputOffset+bufferSize, outputOffset+bufferCapacity)
 	}
 	sizes := make([]int, len(buffers))
 	packets := make([][]byte, len(buffers))
-	var writeBuffers [][]byte
 	for {
-		n, err := s.stack.Read(buffers, sizes, 0)
+		n, err := s.stack.Read(buffers, sizes, outputOffset)
 		for i := 0; i < n; i++ {
-			packets[i] = buffers[i][:sizes[i]]
+			// Keep the full backing capacity so Linux GRO can append merged payloads.
+			packets[i] = buffers[i][: outputOffset+sizes[i] : outputOffset+bufferCapacity]
 		}
-		if writeErr := s.writePacketsWithBuffers(packets[:n], &writeBuffers); writeErr != nil {
+		if writeErr := s.writePackets(packets[:n], outputOffset); writeErr != nil {
 			if E.IsClosed(writeErr) {
 				return
 			}
@@ -328,60 +347,82 @@ func (s *Mipstack) writeLoop() {
 	}
 }
 
-func (s *Mipstack) writePacket(packet []byte) error {
-	return s.writePackets([][]byte{packet})
-}
-
-// writePackets owns its scratch storage so output and reflection can run concurrently.
-func (s *Mipstack) writePackets(packets [][]byte) error {
-	var writeBuffers [][]byte
-	return s.writePacketsWithBuffers(packets, &writeBuffers)
-}
-
-// scratch belongs to the caller; the output loop reuses its own GRO storage.
-func (s *Mipstack) writePacketsWithBuffers(packets [][]byte, scratch *[][]byte) error {
+// writePackets writes packets to s.tun. In every packet, packet[offset:] is the
+// IP packet and bytes before offset are available headroom.
+//
+// Platform-specific requirements:
+//
+//   - Linux TUN with VNET headers: offset must identify headroom at least as
+//     large as the device's virtio header. If it is smaller, writePackets
+//     creates framed copies. BatchWrite may run GRO for multiple packets in
+//     this call; any packet can become the aggregate target (TCP may move the
+//     target when prepending), so every possible target needs writable tailroom
+//     if callers want merging. The capacity only needs to cover the aggregate
+//     formed by this call; gsoMaxSize is an upper-bound preallocation, not a
+//     strict requirement. Insufficient capacity skips that merge and writes the
+//     packets separately. A one-packet call has no tailroom requirement.
+//
+//   - Darwin utun: four bytes immediately before the IP packet hold the
+//     big-endian address-family header. If offset is smaller than four,
+//     writePackets creates a framed copy; otherwise it writes the header in
+//     place and sends from offset-4. Darwin does not perform GRO, so no extra
+//     tailroom is needed.
+//
+//   - Other devices: packet[offset:] is written directly, with no extra
+//     headroom or tailroom requirements.
+//
+// Direct Linux and Darwin paths may modify the supplied buffers. Callers must
+// not modify them concurrently while this function is running.
+func (s *Mipstack) writePackets(packets [][]byte, offset int) error {
 	if len(packets) == 0 {
 		return nil
 	}
 	// Only GSO devices initialize the GRO tables used by BatchWrite.
 	if linux, ok := s.tun.(LinuxTUN); ok && linux.FrontHeadroom() > 0 {
-		offset := linux.FrontHeadroom()
-		// GRO mutates packets and needs tailroom to append adjacent segments.
-		for len(*scratch) < len(packets) {
-			*scratch = append(*scratch, make([]byte, offset+65535))
+		deviceOffset := linux.FrontHeadroom()
+		if offset < deviceOffset {
+			framed := make([][]byte, len(packets))
+			for i, packet := range packets {
+				packet = packet[offset:]
+				framed[i] = make([]byte, deviceOffset+len(packet), deviceOffset+int(gsoMaxSize))
+				copy(framed[i][deviceOffset:], packet)
+			}
+			packets = framed
+			offset = deviceOffset
 		}
-		writeBuffers := (*scratch)[:len(packets)]
-		for i, packet := range packets {
-			writeBuffers[i] = writeBuffers[i][:offset+len(packet)]
-			copy(writeBuffers[i][offset:], packet)
-		}
-		_, err := linux.BatchWrite(writeBuffers, offset)
+		_, err := linux.BatchWrite(packets, offset)
 		return err
 	}
 	if darwin, ok := s.tun.(DarwinTUN); ok {
-		// Use caller-owned storage instead of NativeTun's shared batch descriptors.
-		if len(*scratch) == 0 {
-			*scratch = append(*scratch, nil)
+		if offset < 4 {
+			framed := make([][]byte, len(packets))
+			for i, packet := range packets {
+				packet = packet[offset:]
+				framed[i] = make([]byte, 4+len(packet))
+				copy(framed[i][4:], packet)
+			}
+			packets = framed
+			offset = 4
 		}
 		for _, packet := range packets {
-			if cap((*scratch)[0]) < 4+len(packet) {
-				(*scratch)[0] = make([]byte, 4+len(packet))
-			}
-			buffer := (*scratch)[0][:4+len(packet)]
+			ipPacket := packet[offset:]
+			familyHeader := packet[offset-4 : offset]
 			// Darwin utun requires a four-byte, big-endian address family header.
-			copy(buffer, []byte{0, 0, 0, 2}) // AF_INET on Darwin.
-			if header.IPVersion(packet) == header.IPv6Version {
-				buffer[3] = 30 // AF_INET6 on Darwin, even when tested on another OS.
+			familyHeader[0] = 0
+			familyHeader[1] = 0
+			familyHeader[2] = 0
+			familyHeader[3] = 2 // AF_INET on Darwin.
+			if header.IPVersion(ipPacket) == header.IPv6Version {
+				familyHeader[3] = 30 // AF_INET6 on Darwin, even when tested on another OS.
 			}
-			copy(buffer[4:], packet)
-			if _, err := darwin.Write(buffer); err != nil {
+			if _, err := darwin.Write(packet[offset-4:]); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	for _, packet := range packets {
-		_, err := s.tun.Write(packet)
+		_, err := s.tun.Write(packet[offset:])
 		if err != nil {
 			return err
 		}

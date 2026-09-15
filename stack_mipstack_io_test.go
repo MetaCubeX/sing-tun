@@ -334,10 +334,9 @@ func TestMipsConcurrentOutputAndReflection(t *testing.T) {
 	first, second := []byte("stack output"), []byte("reflected packet")
 	results := make(chan error, 2)
 	go func() {
-		var scratch [][]byte
-		results <- s.writePacketsWithBuffers([][]byte{first}, &scratch)
+		results <- s.writePackets([][]byte{first}, 0)
 	}()
-	go func() { results <- s.writePacket(second) }()
+	go func() { results <- s.writePackets([][]byte{second}, 0) }()
 	for i := 0; i < 2; i++ {
 		select {
 		case <-d.entered:
@@ -383,10 +382,9 @@ func TestMipsDarwinConcurrentOutputAndReflection(t *testing.T) {
 	second := ipPacket(netip.MustParseAddr("fd00::1"), netip.MustParseAddr("fd00::2"), 253, []byte("reflection"))
 	results := make(chan error, 2)
 	go func() {
-		var scratch [][]byte
-		results <- s.writePacketsWithBuffers([][]byte{first}, &scratch)
+		results <- s.writePackets([][]byte{first}, 0)
 	}()
-	go func() { results <- s.writePacket(second) }()
+	go func() { results <- s.writePackets([][]byte{second}, 0) }()
 	for i := 0; i < 2; i++ {
 		select {
 		case <-d.entered:

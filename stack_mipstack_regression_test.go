@@ -38,10 +38,10 @@ func TestMipsFamiliesWithoutInterfaceAddresses(t *testing.T) {
 					source, target = netip.MustParseAddr("fd00::2"), netip.MustParseAddr("2001:4860::8888")
 					offset = 40
 				}
-				s.processPacket(udpPacket(source, target, 53, []byte("reply")))
+				s.processPacket(udpPacket(source, target, 53, []byte("reply")), 0)
 				packet := readPacket(t, d)
 				require.Equal(t, "reply", string(packet[offset+8:]))
-				s.processPacket(tcpPacket(source, target, 100, 0, 2, nil))
+				s.processPacket(tcpPacket(source, target, 100, 0, 2, nil), 0)
 				packet = readPacket(t, d)
 				require.Equal(t, byte(0x12), packet[offset+13]&0x12)
 			})
@@ -69,7 +69,7 @@ func TestMipsUnknownProtocolRejection(t *testing.T) {
 				kind, code, offset = 4, 1, 40
 			}
 			input := ipPacket(source, target, 253, bytes.Repeat([]byte{42}, 64))
-			s.processPacket(input)
+			s.processPacket(input, 0)
 			response := readPacket(t, d)
 			require.Equal(t, []byte{kind, code}, response[offset:offset+2])
 			parsed, err := mips.ParseIPPacket(response)
@@ -88,9 +88,9 @@ func TestMipsUnknownProtocolRejection(t *testing.T) {
 			// An ICMP error must not trigger another error; IPv6 No Next Header
 			// is also explicitly silent rather than an unknown protocol.
 			if ipv6 {
-				s.processPacket(ipPacket(source, target, 59, nil))
+				s.processPacket(ipPacket(source, target, 59, nil), 0)
 			}
-			s.processPacket(response)
+			s.processPacket(response, 0)
 			select {
 			case p := <-d.out:
 				t.Fatalf("recursive error: %x", p)
@@ -98,6 +98,23 @@ func TestMipsUnknownProtocolRejection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMipsProcessPacketOffset(t *testing.T) {
+	d := newMemoryTun()
+	s := testStack(t, d, &testHandler{}, nil)
+	source, target := netip.MustParseAddr("198.18.0.2"), netip.MustParseAddr("8.8.8.8")
+	input := ipPacket(source, target, 253, bytes.Repeat([]byte{42}, 64))
+	const packetOffset = 7
+	framed := make([]byte, packetOffset+len(input))
+	copy(framed[packetOffset:], input)
+
+	s.processPacket(framed, packetOffset)
+	response := readPacket(t, d)
+	parsed, err := mips.ParseIPPacket(response)
+	require.NoError(t, err)
+	require.Equal(t, source, parsed.Destination)
+	require.Equal(t, target, parsed.Source)
 }
 
 func TestMipsLoopbackValidation(t *testing.T) {
@@ -117,20 +134,20 @@ func TestMipsLoopbackValidation(t *testing.T) {
 					o.TunOptions.Inet4LoopbackAddress = []netip.Addr{target}
 				}
 			})
-			s.processPacket(ipPacket(source, target, 6, []byte{1, 2}))
+			s.processPacket(ipPacket(source, target, 6, []byte{1, 2}), 0)
 			bad := tcpPacket(source, target, 100, 0, 2, nil)
 			bad[offset+12] = 0xf0
-			s.processPacket(bad)
+			s.processPacket(bad, 0)
 			bad = tcpPacket(source, target, 100, 0, 2, []byte("bad checksum"))
 			bad[len(bad)-1] ^= 1
-			s.processPacket(bad)
+			s.processPacket(bad, 0)
 			good := tcpPacket(source, target, 100, 0, 2, nil)
 			if ipv6 {
 				good = append(append(append([]byte(nil), good[:40]...), 6, 0, 0, 0, 0, 0, 0, 0), good[40:]...)
 				good[6] = 0
 				binary.BigEndian.PutUint16(good[4:], uint16(len(good)-40))
 			}
-			s.processPacket(good)
+			s.processPacket(good, 0)
 			response := readPacket(t, d)
 			require.Len(t, response, len(good))
 			parsed, err := mips.ParseIPPacket(response)
@@ -165,8 +182,8 @@ func TestMipsWindowsRingFullKeepsStackAlive(t *testing.T) {
 	d := &ringFullTun{windowsTun: &windowsTun{newMemoryTun(), make(chan struct{}, 1)}, full: true}
 	s := testStack(t, d, &testHandler{}, nil)
 	packet := udpPacket(netip.MustParseAddr("198.18.0.1"), netip.MustParseAddr("224.0.0.1"), 53, nil)
-	s.processPacket(packet)
-	s.processPacket(packet)
+	s.processPacket(packet, 0)
+	s.processPacket(packet, 0)
 	require.Equal(t, packet, readPacket(t, d.memoryTun))
 }
 
@@ -178,6 +195,37 @@ type batchLinuxTun struct {
 func (d *batchLinuxTun) BatchWrite(p [][]byte, offset int) (int, error) {
 	d.counts = append(d.counts, len(p))
 	return d.linuxTun.BatchWrite(p, offset)
+}
+
+type directBatchLinuxTun struct {
+	*linuxTun
+	received [][]byte
+}
+
+func (d *directBatchLinuxTun) BatchWrite(p [][]byte, offset int) (int, error) {
+	d.received = p
+	for _, packet := range p {
+		if _, err := d.memoryTun.Write(packet[offset:]); err != nil {
+			return 0, err
+		}
+	}
+	return len(p), nil
+}
+
+func TestMipsOutputUsesOffsetBuffers(t *testing.T) {
+	const offset = 12
+	d := &directBatchLinuxTun{linuxTun: &linuxTun{newMemoryTun(), 10}}
+	s := &Mipstack{tun: d}
+	payload := ipPacket(netip.MustParseAddr("8.8.8.8"), netip.MustParseAddr("198.18.0.2"), 253, []byte("direct"))
+	buffer := make([]byte, offset+len(payload))
+	copy(buffer[offset:], payload)
+
+	require.NoError(t, s.writePackets([][]byte{buffer}, offset))
+	require.Len(t, d.received, 1)
+	if &d.received[0][0] != &buffer[0] {
+		t.Fatal("output path copied an already framed packet")
+	}
+	require.Equal(t, payload, readPacket(t, d.memoryTun))
 }
 
 type batchDarwinTun struct {
@@ -195,7 +243,7 @@ func TestMipsOutputBatching(t *testing.T) {
 	t.Run("linux", func(t *testing.T) {
 		d := &batchLinuxTun{linuxTun: &linuxTun{newMemoryTun(), 10}}
 		s := testStack(t, d, &testHandler{}, nil)
-		require.NoError(t, s.writePackets(packets))
+		require.NoError(t, s.writePackets(packets, 0))
 		require.Equal(t, []int{3}, d.counts)
 		for range packets {
 			require.Equal(t, packets[0], readPacket(t, d.memoryTun))
@@ -204,7 +252,7 @@ func TestMipsOutputBatching(t *testing.T) {
 	t.Run("darwin", func(t *testing.T) {
 		d := &batchDarwinTun{darwinTun: &darwinTun{newMemoryTun()}}
 		s := testStack(t, d, &testHandler{}, nil)
-		require.NoError(t, s.writePackets(packets))
+		require.NoError(t, s.writePackets(packets, 0))
 		require.Empty(t, d.counts, "Darwin output must not use shared batch descriptors")
 		for range packets {
 			require.Equal(t, packets[0], readPacket(t, d.memoryTun))
@@ -233,7 +281,7 @@ func TestMipsLoopbackFragments(t *testing.T) {
 			require.NoError(t, err)
 			require.Greater(t, len(fragments), 1)
 			for _, fragment := range fragments {
-				s.processPacket(fragment)
+				s.processPacket(fragment, 0)
 				response := readPacket(t, d)
 				reflected, err := mips.ParseIPPacket(response)
 				require.NoError(t, err)
@@ -253,6 +301,6 @@ func TestMipsNonUnicastBeforeChecksumValidation(t *testing.T) {
 	s := testStack(t, d, &testHandler{}, nil)
 	packet := udpPacket(netip.MustParseAddr("198.18.0.2"), netip.MustParseAddr("224.0.0.1"), 53, []byte("reflect"))
 	packet[10] ^= 1
-	s.processPacket(packet)
+	s.processPacket(packet, 0)
 	require.Equal(t, packet, readPacket(t, d))
 }

@@ -152,7 +152,7 @@ func TestICMPAdmissionLimitDoesNotBlockInput(t *testing.T) {
 	// The first request blocks in PrepareConnection. Processing well beyond the
 	// admission limit proves packet handling keeps admitting and dropping
 	// packets instead of waiting for preparation.
-	s.processPacket(packet)
+	s.processPacket(packet, 0)
 	select {
 	case <-started:
 	case <-time.After(time.Second):
@@ -161,7 +161,7 @@ func TestICMPAdmissionLimitDoesNotBlockInput(t *testing.T) {
 	sent := make(chan struct{})
 	go func() {
 		for i := 0; i < 64; i++ {
-			s.processPacket(packet)
+			s.processPacket(packet, 0)
 		}
 		close(sent)
 	}()
@@ -203,7 +203,7 @@ func TestICMPAdmissionLimitDoesNotBlockInput(t *testing.T) {
 
 	// Once preparation has completed and the slots drain, a fresh request is
 	// admitted again.
-	s.processPacket(packet)
+	s.processPacket(packet, 0)
 	readPacket(t, d)
 }
 
@@ -265,7 +265,7 @@ func TestMipsICMPResetAdministrativelyProhibited(t *testing.T) {
 			}
 			payload := make([]byte, 1400)
 			payload[0] = kind
-			s.processPacket(transportPacket(source, target, protocol, payload))
+			s.processPacket(transportPacket(source, target, protocol, payload), 0)
 			response := readPacket(t, d)
 			require.LessOrEqual(t, len(response), limit)
 			require.Equal(t, code, response[offset+1])
@@ -324,7 +324,7 @@ func TestMipsICMPRepliesOnly(t *testing.T) {
 					t.Cleanup(func() { _ = destination.Close() })
 					return destination, nil
 				}}, nil)
-				s.processPacket(input)
+				s.processPacket(input, 0)
 				select {
 				case <-prepared:
 				case <-time.After(time.Second):
