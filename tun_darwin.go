@@ -336,6 +336,10 @@ func configure(tunFd int, recvMsgX bool, batchSize int) error {
 	return nil
 }
 
+func (t *NativeTun) BatchSize() int {
+	return t.batchSize
+}
+
 func (t *NativeTun) BatchRead() ([]*buf.Buffer, error) {
 	for i := 0; i < t.batchSize; i++ {
 		iovecs := t.iovecs[i].nextIovecs()

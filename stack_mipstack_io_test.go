@@ -162,6 +162,8 @@ func (d *windowsTun) ReadPacket() ([]byte, func(), error) {
 
 type darwinTun struct{ *memoryTun }
 
+func (d *darwinTun) BatchSize() int { return 4 }
+
 func (d *darwinTun) Read(p []byte) (int, error) {
 	n, err := d.memoryTun.Read(p[4:])
 	if err != nil {

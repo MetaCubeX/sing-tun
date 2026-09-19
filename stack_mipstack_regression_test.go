@@ -38,10 +38,10 @@ func TestMipsFamiliesWithoutInterfaceAddresses(t *testing.T) {
 					source, target = netip.MustParseAddr("fd00::2"), netip.MustParseAddr("2001:4860::8888")
 					offset = 40
 				}
-				s.processPacket(udpPacket(source, target, 53, []byte("reply")), 0)
+				s.processPackets([][]byte{udpPacket(source, target, 53, []byte("reply"))}, 0)
 				packet := readPacket(t, d)
 				require.Equal(t, "reply", string(packet[offset+8:]))
-				s.processPacket(tcpPacket(source, target, 100, 0, 2, nil), 0)
+				s.processPackets([][]byte{tcpPacket(source, target, 100, 0, 2, nil)}, 0)
 				packet = readPacket(t, d)
 				require.Equal(t, byte(0x12), packet[offset+13]&0x12)
 			})
@@ -69,7 +69,7 @@ func TestMipsUnknownProtocolRejection(t *testing.T) {
 				kind, code, offset = 4, 1, 40
 			}
 			input := ipPacket(source, target, 253, bytes.Repeat([]byte{42}, 64))
-			s.processPacket(input, 0)
+			s.processPackets([][]byte{input}, 0)
 			response := readPacket(t, d)
 			require.Equal(t, []byte{kind, code}, response[offset:offset+2])
 			parsed, err := mips.ParseIPPacket(response)
@@ -88,9 +88,9 @@ func TestMipsUnknownProtocolRejection(t *testing.T) {
 			// An ICMP error must not trigger another error; IPv6 No Next Header
 			// is also explicitly silent rather than an unknown protocol.
 			if ipv6 {
-				s.processPacket(ipPacket(source, target, 59, nil), 0)
+				s.processPackets([][]byte{ipPacket(source, target, 59, nil)}, 0)
 			}
-			s.processPacket(response, 0)
+			s.processPackets([][]byte{response}, 0)
 			select {
 			case p := <-d.out:
 				t.Fatalf("recursive error: %x", p)
@@ -100,7 +100,7 @@ func TestMipsUnknownProtocolRejection(t *testing.T) {
 	}
 }
 
-func TestMipsProcessPacketOffset(t *testing.T) {
+func TestMipsProcessPacketsOffset(t *testing.T) {
 	d := newMemoryTun()
 	s := testStack(t, d, &testHandler{}, nil)
 	source, target := netip.MustParseAddr("198.18.0.2"), netip.MustParseAddr("8.8.8.8")
@@ -109,7 +109,7 @@ func TestMipsProcessPacketOffset(t *testing.T) {
 	framed := make([]byte, packetOffset+len(input))
 	copy(framed[packetOffset:], input)
 
-	s.processPacket(framed, packetOffset)
+	s.processPackets([][]byte{framed}, packetOffset)
 	response := readPacket(t, d)
 	parsed, err := mips.ParseIPPacket(response)
 	require.NoError(t, err)
@@ -134,20 +134,20 @@ func TestMipsLoopbackValidation(t *testing.T) {
 					o.TunOptions.Inet4LoopbackAddress = []netip.Addr{target}
 				}
 			})
-			s.processPacket(ipPacket(source, target, 6, []byte{1, 2}), 0)
+			s.processPackets([][]byte{ipPacket(source, target, 6, []byte{1, 2})}, 0)
 			bad := tcpPacket(source, target, 100, 0, 2, nil)
 			bad[offset+12] = 0xf0
-			s.processPacket(bad, 0)
+			s.processPackets([][]byte{bad}, 0)
 			bad = tcpPacket(source, target, 100, 0, 2, []byte("bad checksum"))
 			bad[len(bad)-1] ^= 1
-			s.processPacket(bad, 0)
+			s.processPackets([][]byte{bad}, 0)
 			good := tcpPacket(source, target, 100, 0, 2, nil)
 			if ipv6 {
 				good = append(append(append([]byte(nil), good[:40]...), 6, 0, 0, 0, 0, 0, 0, 0), good[40:]...)
 				good[6] = 0
 				binary.BigEndian.PutUint16(good[4:], uint16(len(good)-40))
 			}
-			s.processPacket(good, 0)
+			s.processPackets([][]byte{good}, 0)
 			response := readPacket(t, d)
 			require.Len(t, response, len(good))
 			parsed, err := mips.ParseIPPacket(response)
@@ -182,8 +182,8 @@ func TestMipsWindowsRingFullKeepsStackAlive(t *testing.T) {
 	d := &ringFullTun{windowsTun: &windowsTun{newMemoryTun(), make(chan struct{}, 1)}, full: true}
 	s := testStack(t, d, &testHandler{}, nil)
 	packet := udpPacket(netip.MustParseAddr("198.18.0.1"), netip.MustParseAddr("224.0.0.1"), 53, nil)
-	s.processPacket(packet, 0)
-	s.processPacket(packet, 0)
+	s.processPackets([][]byte{packet}, 0)
+	s.processPackets([][]byte{packet}, 0)
 	require.Equal(t, packet, readPacket(t, d.memoryTun))
 }
 
@@ -260,6 +260,28 @@ func TestMipsOutputBatching(t *testing.T) {
 	})
 }
 
+func TestMipsProcessPacketsInPlaceBatching(t *testing.T) {
+	d := &batchLinuxTun{linuxTun: &linuxTun{newMemoryTun(), 10}}
+	s := testStack(t, d, &testHandler{}, nil)
+	source := netip.MustParseAddr("198.18.0.2")
+	multicast := netip.MustParseAddr("224.0.0.1")
+	first := udpPacket(source, multicast, 53, []byte("first"))
+	second := udpPacket(source, multicast, 53, []byte("second"))
+	stackPacket := udpPacket(source, netip.MustParseAddr("8.8.8.8"), 53, []byte("stack"))
+	packets := [][]byte{
+		first,
+		stackPacket,
+		second,
+	}
+
+	s.processPackets(packets, 0)
+
+	require.Equal(t, []int{2}, d.counts)
+	require.Equal(t, first, readPacket(t, d.memoryTun))
+	require.Equal(t, second, readPacket(t, d.memoryTun))
+	require.Equal(t, [][]byte{stackPacket, first, second}, packets)
+}
+
 func TestMipsLoopbackFragments(t *testing.T) {
 	for _, ipv6 := range []bool{false, true} {
 		t.Run(map[bool]string{false: "ipv4", true: "ipv6"}[ipv6], func(t *testing.T) {
@@ -282,7 +304,7 @@ func TestMipsLoopbackFragments(t *testing.T) {
 			require.Greater(t, len(fragments), 1)
 			for _, fragment := range fragments {
 				before := append([]byte(nil), fragment...)
-				s.processPacket(fragment, 0)
+				s.processPackets([][]byte{fragment}, 0)
 				response := readPacket(t, d)
 				reflected, err := mips.ParseIPPacket(response)
 				require.NoError(t, err)
@@ -303,7 +325,7 @@ func TestMipsNonUnicastChecksumValidation(t *testing.T) {
 	packet := udpPacket(netip.MustParseAddr("198.18.0.2"), netip.MustParseAddr("224.0.0.1"), 53, []byte("reflect"))
 	invalid := append([]byte(nil), packet...)
 	invalid[10] ^= 1
-	s.processPacket(invalid, 0)
-	s.processPacket(packet, 0)
+	s.processPackets([][]byte{invalid}, 0)
+	s.processPackets([][]byte{packet}, 0)
 	require.Equal(t, packet, readPacket(t, d))
 }

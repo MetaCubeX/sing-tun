@@ -8,6 +8,7 @@ import (
 	"github.com/metacubex/mipstack"
 	E "github.com/metacubex/sing/common/exceptions"
 	"github.com/metacubex/sing/common/logger"
+	"golang.org/x/exp/slices"
 )
 
 type Mipstack struct {
@@ -144,10 +145,12 @@ func (s *Mipstack) readLoop() {
 		offset = 4
 	}
 	buffer := make([]byte, int(s.mtu)+offset)
+	packets := make([][]byte, 1)
 	for {
 		n, err := device.Read(buffer)
 		if n > offset {
-			s.processPacket(buffer[:n], offset)
+			packets[0] = buffer[:n]
+			s.processPackets(packets, offset)
 		}
 		if err != nil {
 			if E.IsClosed(err) {
@@ -159,10 +162,12 @@ func (s *Mipstack) readLoop() {
 }
 
 func (s *Mipstack) wintunLoop(winTun WinTun) {
+	packets := make([][]byte, 1)
 	for {
 		packet, release, err := winTun.ReadPacket()
 		if len(packet) > 0 {
-			s.processPacket(packet, 0)
+			packets[0] = packet
+			s.processPackets(packets, 0)
 		}
 		if release != nil {
 			release()
@@ -183,10 +188,14 @@ func (s *Mipstack) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 		buffers[i] = make([]byte, int(s.mtu)+offset)
 	}
 	sizes := make([]int, len(buffers))
+	packets := make([][]byte, len(buffers))
 	for {
 		n, err := linuxTUN.BatchRead(buffers, offset, sizes)
 		for i := 0; i < n; i++ {
-			s.processPacket(buffers[i][:offset+sizes[i]], offset)
+			packets[i] = buffers[i][:offset+sizes[i]]
+		}
+		if n > 0 {
+			s.processPackets(packets[:n], offset)
 		}
 		if err != nil {
 			if E.IsClosed(err) {
@@ -198,11 +207,17 @@ func (s *Mipstack) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 }
 
 func (s *Mipstack) batchLoopDarwin(darwinTUN DarwinTUN) {
+	packets := make([][]byte, darwinTUN.BatchSize())
 	for {
 		buffers, err := darwinTUN.BatchRead()
-		for _, buffer := range buffers {
-			s.processPacket(buffer.Bytes(), 0)
-			buffer.Release()
+		if len(buffers) > 0 {
+			for i, buffer := range buffers {
+				packets[i] = buffer.Bytes()
+			}
+			s.processPackets(packets[:len(buffers)], 0)
+			for _, buffer := range buffers {
+				buffer.Release()
+			}
 		}
 		if err != nil {
 			if E.IsClosed(err) {
@@ -213,56 +228,93 @@ func (s *Mipstack) batchLoopDarwin(darwinTUN DarwinTUN) {
 	}
 }
 
-// processPacket processes an IP packet beginning at offset. The leading bytes
-// are retained when handing the buffer to mipstack so callers can reuse their
-// existing packet storage without first slicing away device metadata.
-// The caller must provide exclusive, writable access until this call returns.
-// Reflection may rewrite packet in place. Neither writePackets nor stack.Write
-// uses its contents after returning, so read loops may then reuse or release it.
-func (s *Mipstack) processPacket(packet []byte, offset int) {
-	ipPacket := packet[offset:]
-	parsed, err := mipstack.ParseIPPacket(ipPacket)
-	if err != nil {
-		return
-	}
-	destination := parsed.Destination
-	// Reflect non-unicast packets after IP validation, without offering them
-	// to protocol forwarders.
-	if destination == s.broadcastAddr || !destination.IsGlobalUnicast() {
-		if err := s.writePackets([][]byte{packet}, offset); err != nil {
-			s.logger.Trace(E.Cause(err, "write packet"))
-		}
-		return
-	}
-	addresses := s.inet4LoopbackAddress
-	if destination.Is6() {
-		addresses = s.inet6LoopbackAddress
-	}
-	for _, address := range addresses {
-		if address != destination {
+// processPackets consumes packet slice entries beginning at offset. It
+// partitions the slice in place into stack-bound and reflected packets without
+// copying packet contents. Callers must provide exclusive, writable packet
+// buffers until this call returns, after which they may reuse or release them.
+func (s *Mipstack) processPackets(packets [][]byte, offset int) {
+	stackCount, packetCount := 0, 0
+	for _, packet := range packets {
+		ipPacket := packet[offset:]
+		destination, ok := mipsPacketDestination(ipPacket)
+		if !ok {
 			continue
 		}
-		if !mipsValidLoopbackPacket(parsed) {
-			break
+
+		addresses := s.inet4LoopbackAddress
+		if destination.Is6() {
+			addresses = s.inet6LoopbackAddress
 		}
-		parsed.Source, parsed.Destination = parsed.Destination, parsed.Source
-		// AppendRawBinary supports overlapping input and output. Swapping
-		// addresses does not change the encoded length, so packet has enough
-		// capacity and its payload stays at the same location.
-		_, err := parsed.AppendRawBinary(packet[:offset])
-		if err != nil {
-			return
+		reflected := destination == s.broadcastAddr || !destination.IsGlobalUnicast()
+		loopback := !reflected && slices.Contains(addresses, destination)
+
+		// Packets that bypass mipstack still require complete IP validation.
+		if reflected || loopback {
+			parsed, err := mipstack.ParseIPPacket(ipPacket)
+			if err != nil {
+				continue
+			}
+			if loopback && mipsValidLoopbackPacket(parsed) {
+				parsed.Source, parsed.Destination = parsed.Destination, parsed.Source
+				// AppendRawBinary supports overlapping input and output. Swapping
+				// addresses does not change the encoded length, so packet has enough
+				// capacity and its payload stays at the same location.
+				_, err = parsed.AppendRawBinary(packet[:offset])
+				if err != nil {
+					continue
+				}
+				// Keep the original slice length to preserve link-layer padding.
+				// Swapping addresses preserves the TCP pseudo-header sum, including
+				// for fragments; mipstack recalculates the IPv4 header checksum.
+				reflected = true
+			}
 		}
-		// Keep the original slice length to preserve link-layer padding.
-		// Swapping addresses preserves the TCP pseudo-header sum, including
-		// for fragments; mipstack recalculates the IPv4 header checksum.
-		if err := s.writePackets([][]byte{packet}, offset); err != nil {
+
+		// Keep the retained prefix laid out as [stack packets][reflected packets].
+		if reflected {
+			packets[packetCount] = packet
+		} else {
+			if stackCount != packetCount {
+				copy(packets[stackCount+1:packetCount+1], packets[stackCount:packetCount])
+			}
+			packets[stackCount] = packet
+			stackCount++
+		}
+		packetCount++
+	}
+
+	if stackCount > 0 {
+		// Invalid packet errors are local to individual datagrams, not fatal device errors.
+		_, _ = s.stack.Write(packets[:stackCount], offset)
+	}
+	if stackCount < packetCount {
+		if err := s.writePackets(packets[stackCount:packetCount], offset); err != nil {
 			s.logger.Trace(E.Cause(err, "write packet"))
 		}
-		return
 	}
-	// Invalid packet errors are local to the datagram, not fatal device errors.
-	_, _ = s.stack.Write([][]byte{packet}, offset)
+}
+
+// mipsPacketDestination extracts only the destination needed to choose between
+// stack delivery and reflection. Full packet validation remains with mipstack
+// unless the packet is about to bypass it.
+func mipsPacketDestination(packet []byte) (netip.Addr, bool) {
+	if len(packet) < 1 {
+		return netip.Addr{}, false
+	}
+	switch packet[0] >> 4 {
+	case 4:
+		if len(packet) < 20 {
+			return netip.Addr{}, false
+		}
+		return netip.AddrFrom4([4]byte(packet[16:20])), true
+	case 6:
+		if len(packet) < 40 {
+			return netip.Addr{}, false
+		}
+		return netip.AddrFrom16([16]byte(packet[24:40])), true
+	default:
+		return netip.Addr{}, false
+	}
 }
 
 // Validate complete packets before bypassing the stack. Fragment checksums

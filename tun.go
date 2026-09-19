@@ -61,6 +61,7 @@ type LinuxTUN interface {
 
 type DarwinTUN interface {
 	Tun
+	BatchSize() int
 	BatchRead() ([]*buf.Buffer, error)
 	BatchWrite(buffers []*buf.Buffer) error
 }

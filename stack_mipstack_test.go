@@ -91,6 +91,7 @@ func testStack(t *testing.T, device Tun, handler *testHandler, modify func(*Stac
 	t.Cleanup(func() { _ = s.Close(); _ = device.Close() })
 	return s
 }
+
 func readPacket(t *testing.T, d *memoryTun) []byte {
 	t.Helper()
 	select {
