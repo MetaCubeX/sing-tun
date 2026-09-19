@@ -96,6 +96,13 @@ func (r *autoRedirect) setupIPTablesForFamily(iptablesPath string) error {
 	if err != nil {
 		return err
 	}
+	if r.tunOptions.AutoRoute {
+		err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing,
+			"-m conntrack --ctstate DNAT -j RETURN")
+		if err != nil {
+			return err
+		}
+	}
 	var (
 		routeAddress        []netip.Prefix
 		routeExcludeAddress []netip.Prefix
@@ -132,6 +139,12 @@ func (r *autoRedirect) setupIPTablesForFamily(iptablesPath string) error {
 	for _, uid := range r.tunOptions.ExcludeUID {
 		err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing,
 			"-m owner --uid-owner", uid, "-j RETURN")
+		if err != nil {
+			return err
+		}
+	}
+	if r.tunOptions.AutoRoute {
+		err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing, "-m addrtype --dst-type LOCAL -j RETURN")
 		if err != nil {
 			return err
 		}
@@ -187,9 +200,11 @@ func (r *autoRedirect) setupIPTablesForFamily(iptablesPath string) error {
 		}
 	}
 
-	err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing, "-m addrtype --dst-type LOCAL -j RETURN")
-	if err != nil {
-		return err
+	if !r.tunOptions.AutoRoute {
+		err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing, "-m addrtype --dst-type LOCAL -j RETURN")
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(routeAddress) > 0 {
@@ -224,7 +239,11 @@ func (r *autoRedirect) setupIPTablesForFamily(iptablesPath string) error {
 			return err
 		}
 	}
-	err = r.runShell(iptablesPath, "-t nat -I PREROUTING -j", tableNamePreRouteing)
+	preRoutingOperation := "-I"
+	if r.tunOptions.AutoRoute {
+		preRoutingOperation = "-A"
+	}
+	err = r.runShell(iptablesPath, "-t nat", preRoutingOperation, "PREROUTING -j", tableNamePreRouteing)
 	if err != nil {
 		return err
 	}
