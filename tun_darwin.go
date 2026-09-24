@@ -352,6 +352,14 @@ func (t *NativeTun) BatchRead() ([]*buf.Buffer, error) {
 			t.iovecs[k].buffer = nil
 		}
 		t.buffers = t.buffers[:0]
+		// Close can close the TUN/stop descriptors before the batch reader
+		// observes the stop signal. Unlike os.File.Read, the raw syscall
+		// returns EBADF (or ENOTSOCK if the descriptor has been reused).
+		// Normalize these terminal errors so every stack exits its read loop
+		// instead of retrying and logging at full CPU speed.
+		if errno == unix.EBADF || errno == unix.ENOTSOCK {
+			return nil, os.ErrClosed
+		}
 		return nil, errno
 	}
 	if n < 0 {
