@@ -1,6 +1,7 @@
 package tun
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -356,6 +357,9 @@ func (t *NativeTun) BatchRead() ([]*buf.Buffer, error) {
 			t.iovecs[k].buffer = nil
 		}
 		t.buffers = t.buffers[:0]
+		if errors.Is(errno, syscall.ENOTSOCK) || errors.Is(errno, syscall.EBADF) {
+			return nil, os.ErrClosed
+		}
 		return nil, errno
 	}
 	if n < 0 {
@@ -383,6 +387,9 @@ func (t *NativeTun) BatchWrite(buffers []*buf.Buffer) error {
 		for i := range buffers {
 			errno := rawfile.NonBlockingWriteIovec(t.tunFd, t.iovecsOutput[i].iovecs)
 			if errno != 0 {
+				if errors.Is(errno, syscall.ENOTSOCK) || errors.Is(errno, syscall.EBADF) {
+					return os.ErrClosed
+				}
 				return errno
 			}
 		}
@@ -397,6 +404,9 @@ func (t *NativeTun) BatchWrite(buffers []*buf.Buffer) error {
 		for n != len(buffers) {
 			sent, errno := rawfile.NonBlockingSendMMsg(t.tunFd, t.msgHdrsOutput[n:len(buffers)])
 			if errno != 0 {
+				if errors.Is(errno, syscall.ENOTSOCK) || errors.Is(errno, syscall.EBADF) {
+					return os.ErrClosed
+				}
 				return errno
 			}
 			n += sent
