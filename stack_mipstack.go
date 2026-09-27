@@ -2,7 +2,9 @@ package tun
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/metacubex/mipstack"
@@ -21,6 +23,7 @@ type Mipstack struct {
 	inet4LoopbackAddress []netip.Addr
 	inet6LoopbackAddress []netip.Addr
 	broadcastAddr        netip.Addr
+	tcpCongestionControl string
 	icmpMapping          *DirectRouteMapping
 	handler              Handler
 	logger               logger.Logger
@@ -40,6 +43,11 @@ func NewMipstack(options StackOptions) (Stack, error) {
 		inet6Address = options.TunOptions.Inet6Address[0].Addr()
 	}
 
+	tcpCongestionControl := strings.ToLower(options.TCPCongestionControl)
+	if tcpCongestionControl != "" && !slices.Contains(mipstack.AvailableCongestionControls(), tcpCongestionControl) {
+		return nil, fmt.Errorf("invalid TCP congestion control: %s", tcpCongestionControl)
+	}
+
 	s := &Mipstack{
 		ctx:                  options.Context,
 		tun:                  options.Tun,
@@ -50,6 +58,7 @@ func NewMipstack(options StackOptions) (Stack, error) {
 		inet4LoopbackAddress: options.TunOptions.Inet4LoopbackAddress,
 		inet6LoopbackAddress: options.TunOptions.Inet6LoopbackAddress,
 		broadcastAddr:        BroadcastAddr(options.TunOptions.Inet4Address),
+		tcpCongestionControl: tcpCongestionControl,
 		icmpMapping:          NewDirectRouteMapping(options.ICMPTimeout),
 		icmpSlots:            make(chan struct{}, 16),
 		handler:              options.Handler,
@@ -75,6 +84,7 @@ func (s *Mipstack) config() mipstack.Config {
 				Idle:     15 * time.Second,
 				Interval: 15 * time.Second,
 			},
+			CongestionControl: s.tcpCongestionControl,
 		},
 	}
 }
