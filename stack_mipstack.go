@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mipstack"
+	"github.com/metacubex/sing/common/buf"
 	E "github.com/metacubex/sing/common/exceptions"
 	"github.com/metacubex/sing/common/logger"
 	"golang.org/x/exp/slices"
@@ -18,6 +19,7 @@ type Mipstack struct {
 	tun                  Tun
 	mtu                  uint32
 	recvMsgX             bool
+	sendMsgX             bool
 	inet4Address         netip.Addr
 	inet6Address         netip.Addr
 	inet4LoopbackAddress []netip.Addr
@@ -53,6 +55,7 @@ func NewMipstack(options StackOptions) (Stack, error) {
 		tun:                  options.Tun,
 		mtu:                  options.TunOptions.MTU,
 		recvMsgX:             options.TunOptions.EXP_RecvMsgX,
+		sendMsgX:             options.TunOptions.EXP_SendMsgX,
 		inet4Address:         inet4Address,
 		inet6Address:         inet6Address,
 		inet4LoopbackAddress: options.TunOptions.Inet4LoopbackAddress,
@@ -350,6 +353,7 @@ func (s *Mipstack) writeLoop() {
 	outputOffset := 0
 	bufferSize := int(s.mtu)
 	bufferCapacity := bufferSize
+	batchSize := s.stack.BatchSize()
 	// Output buffers include the device header space; Linux GSO buffers also
 	// retain enough capacity for GRO to merge packets without another copy.
 	if linux, ok := s.tun.(LinuxTUN); ok && linux.FrontHeadroom() > 0 {
@@ -357,10 +361,15 @@ func (s *Mipstack) writeLoop() {
 		if bufferCapacity < int(gsoMaxSize) {
 			bufferCapacity = int(gsoMaxSize)
 		}
-	} else if _, ok := s.tun.(DarwinTUN); ok {
+	} else if darwin, ok := s.tun.(DarwinTUN); ok {
 		outputOffset = 4
+		// BatchWrite indexes scratch sized from the device MTU, which can hold
+		// fewer entries than the stack's batch.
+		if deviceBatch := darwin.BatchSize(); s.sendMsgX && deviceBatch < batchSize {
+			batchSize = deviceBatch
+		}
 	}
-	buffers := make([][]byte, s.stack.BatchSize())
+	buffers := make([][]byte, batchSize)
 	for i := range buffers {
 		buffers[i] = make([]byte, outputOffset+bufferSize, outputOffset+bufferCapacity)
 	}
@@ -434,6 +443,21 @@ func (s *Mipstack) writePackets(packets [][]byte, offset int) error {
 		return err
 	}
 	if darwin, ok := s.tun.(DarwinTUN); ok {
+		if s.sendMsgX {
+			// BatchWrite prepends the address family header itself, so it takes the
+			// bare IP packet and needs no headroom. Like the other BatchWrite
+			// callers, it must not be handed an empty buffer.
+			buffers := make([]*buf.Buffer, 0, len(packets))
+			for _, packet := range packets {
+				if packet = packet[offset:]; len(packet) > 0 {
+					buffers = append(buffers, buf.As(packet))
+				}
+			}
+			if len(buffers) == 0 {
+				return nil
+			}
+			return darwin.BatchWrite(buffers)
+		}
 		if offset < 4 {
 			framed := make([][]byte, len(packets))
 			for i, packet := range packets {
