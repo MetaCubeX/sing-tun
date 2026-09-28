@@ -601,6 +601,13 @@ func tcpGRO(bufs [][]byte, offset int, pktI int, table *tcpGROTable, isV6 bool) 
 		srcAddrOffset = ipv6SrcAddrOffset
 		addrLen = 16
 	}
+	if len(bufs) == 1 {
+		// A lone packet has nothing to coalesce with. Inserting it would only
+		// have applyTCPCoalesceAccounting find a single item with numMerged == 0
+		// and encode a zero value virtioNetHdr for it, which is what handleGRO
+		// already does for a noop result. Skip the table entirely.
+		return groResultNoop
+	}
 	items, existing := table.lookupOrInsert(pkt, srcAddrOffset, srcAddrOffset+addrLen, iphLen, tcphLen, pktI)
 	if !existing {
 		return groResultTableInsert
@@ -864,6 +871,13 @@ func udpGRO(bufs [][]byte, offset int, pktI int, table *udpGROTable, isV6 bool) 
 	if isV6 {
 		srcAddrOffset = ipv6SrcAddrOffset
 		addrLen = 16
+	}
+	if len(bufs) == 1 {
+		// A lone packet has nothing to coalesce with. Inserting it would only
+		// have applyUDPCoalesceAccounting find a single item with numMerged == 0
+		// and encode a zero value virtioNetHdr for it, which is what handleGRO
+		// already does for a noop result. Skip the table entirely.
+		return groResultNoop
 	}
 	items, existing := table.lookupOrInsert(pkt, srcAddrOffset, srcAddrOffset+addrLen, iphLen, pktI)
 	if !existing {
