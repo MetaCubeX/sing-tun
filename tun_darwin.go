@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -40,6 +41,11 @@ type NativeTun struct {
 	inet6Address  [16]byte
 	routeSet      bool
 	writeMsgX     bool
+
+	// writeAccess serializes writers on tunFd: sendmsg_x uses MSG_DONTWAIT, so a
+	// concurrent writer holding SB_LOCK makes the kernel free the whole batch yet
+	// still report it as fully sent. Held unconditionally to keep one write path.
+	writeAccess sync.Mutex
 }
 
 type iovecBuffer struct {
@@ -141,6 +147,8 @@ func (t *NativeTun) Read(p []byte) (n int, err error) {
 }
 
 func (t *NativeTun) Write(p []byte) (n int, err error) {
+	t.writeAccess.Lock()
+	defer t.writeAccess.Unlock()
 	return t.tunFile.Write(p)
 }
 
@@ -380,6 +388,9 @@ func (t *NativeTun) BatchRead() ([]*buf.Buffer, error) {
 }
 
 func (t *NativeTun) BatchWrite(buffers []*buf.Buffer) error {
+	// Covers the shared iovecsOutput/msgHdrsOutput scratch as well as the syscall.
+	t.writeAccess.Lock()
+	defer t.writeAccess.Unlock()
 	if !t.writeMsgX {
 		for i, buffer := range buffers {
 			t.iovecsOutput[i].nextIovecsOutput(buffer)

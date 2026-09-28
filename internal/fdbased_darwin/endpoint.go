@@ -122,6 +122,10 @@ type endpoint struct {
 
 	batchSize int
 	sendMsgX  bool
+
+	// writeAccess has the same meaning as Options.WriteAccess. Never nil; New
+	// substitutes a private mutex when the option is omitted.
+	writeAccess sync.Locker
 }
 
 // Options specify the details about the fd-based endpoint to be created.
@@ -172,6 +176,10 @@ type Options struct {
 
 	RecvMsgX bool
 	SendMsgX bool
+
+	// WriteAccess is held across writes to the FDs. Anything else writing to them
+	// must hold it too. When nil, New substitutes a private mutex.
+	WriteAccess sync.Locker
 }
 
 // New creates a new fd-based endpoint.
@@ -223,6 +231,10 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 		writevMaxIovs:         rawfile.MaxIovs,
 		batchSize:             batchSize,
 		sendMsgX:              opts.SendMsgX,
+		writeAccess:           opts.WriteAccess,
+	}
+	if e.writeAccess == nil {
+		e.writeAccess = new(sync.Mutex)
 	}
 	if e.maxSyscallHeaderBytes != 0 {
 		if max := int(e.maxSyscallHeaderBytes / rawfile.SizeofIovec); max < e.writevMaxIovs {
@@ -449,6 +461,11 @@ func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []*stack.PacketBuffer) (in
 		}
 		return written, err
 	}
+
+	// Covers both the sendmsg_x loop below and its writePacket fallback, so
+	// writePacket itself must not lock. See tun.NativeTun.writeAccess for why.
+	e.writeAccess.Lock()
+	defer e.writeAccess.Unlock()
 
 	// Send a batch of packets through batchFD.
 	batchFD := batchFDInfo.fd

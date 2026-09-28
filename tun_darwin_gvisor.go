@@ -40,6 +40,8 @@ func (t *NativeTun) WritePacket(pkt *stack.PacketBuffer) (int, error) {
 		iovec.SetLen(len(packetSlice))
 		iovecs = append(iovecs, iovec)
 	}
+	t.writeAccess.Lock()
+	defer t.writeAccess.Unlock()
 	errno := rawfile.NonBlockingWriteIovec(t.tunFd, iovecs)
 	if errno == 0 {
 		return dataLen, nil
@@ -56,6 +58,8 @@ func (t *NativeTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error) 
 		RXChecksumOffload:    true,
 		RecvMsgX:             t.options.EXP_RecvMsgX,
 		SendMsgX:             t.options.EXP_SendMsgX,
+		// The endpoint writes to t.tunFd concurrently with NativeTun's own writers.
+		WriteAccess: &t.writeAccess,
 	})
 	if err != nil {
 		return nil, stack.NICOptions{}, err
