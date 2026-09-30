@@ -141,6 +141,13 @@ func (s *Mipstack) Close() error {
 
 func (s *Mipstack) readLoop() {
 	device := s.tun
+	switch device.(type) {
+	case WinTun, LinuxTUN, DarwinTUN:
+		// system tun always offloads RX checksums
+		var offload mipstack.RXChecksumOffload
+		offload.SetIPv4Header(true).SetTCP(true).SetUDP(true)
+		s.stack.SetRXChecksumOffload(offload)
+	}
 	if linuxTUN, isLinuxTUN := device.(LinuxTUN); isLinuxTUN && linuxTUN.FrontHeadroom() > 0 {
 		s.batchLoopLinux(linuxTUN, linuxTUN.BatchSize())
 		return
