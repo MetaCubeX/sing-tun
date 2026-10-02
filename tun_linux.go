@@ -233,7 +233,10 @@ func (t *NativeTun) BatchWrite(buffers [][]byte, offset int) (int, error) {
 	)
 	t.gsoToWrite = t.gsoToWrite[:0]
 	if t.vnetHdr {
-		err := handleGRO(buffers, offset, t.tcpGROTable, t.udpGROTable, t.gro, &t.gsoToWrite)
+		// Callers supply complete checksums when TX checksum offload is disabled.
+		// With TX offload enabled, checksums may be unset or partial, so retain
+		// validation to avoid coalescing packets with incomplete checksums.
+		err := handleGRO(buffers, offset, t.tcpGROTable, t.udpGROTable, t.gro, !t.txChecksumOffload, &t.gsoToWrite)
 		if err != nil {
 			return 0, err
 		}
