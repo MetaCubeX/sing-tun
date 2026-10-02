@@ -62,6 +62,17 @@ func newIovecBuffer(mtu int) iovecBuffer {
 }
 
 func (b *iovecBuffer) nextIovecs() []unix.Iovec {
+	// Keep the utun header and IP packet together so reflection can reuse the frame.
+	// NewSize only pools buffers up to 65535 bytes.
+	if b.mtu <= 65535-PacketOffset {
+		if b.buffer == nil {
+			b.buffer = buf.NewSize(b.mtu + PacketOffset)
+			b.iovecs[0] = b.buffer.Iovec(b.buffer.Cap())
+			b.buffer.Advance(PacketOffset)
+		}
+		return b.iovecs[:1]
+	}
+	// Keep the header separate so a maximum-MTU IP packet still fits in the pool.
 	if b.iovecs[0].Len == 0 {
 		headBuffer := make([]byte, PacketOffset)
 		b.iovecs[0].Base = &headBuffer[0]
@@ -391,7 +402,7 @@ func (t *NativeTun) BatchRead() ([]*buf.Buffer, error) {
 		// https://github.com/Darm64/XNU/blob/xnu-2782.40.9/bsd/kern/uipc_syscalls.c#L2026-L2048
 		t.msgHdrs[i] = rawfile.MsgHdrX{}
 		t.msgHdrs[i].Msg.Iov = &iovecs[0]
-		t.msgHdrs[i].Msg.Iovlen = 2
+		t.msgHdrs[i].Msg.Iovlen = int32(len(iovecs))
 	}
 	n, errno := rawfile.BlockingRecvMMsgUntilStopped(t.stopFd.ReadFD, t.tunFd, t.msgHdrs)
 	if errno != 0 {
