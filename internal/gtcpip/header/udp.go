@@ -139,26 +139,35 @@ func (b UDP) Encode(u *UDPFields) {
 func (b UDP) SetSourcePortWithChecksumUpdate(new uint16) {
 	old := b.SourcePort()
 	b.SetSourcePort(new)
-	b.SetChecksum(^checksumUpdate2ByteAlignedUint16(^b.Checksum(), old, new))
+	if b.Checksum() == 0 {
+		return
+	}
+	b.SetChecksum(NormalizeUDPChecksum(^checksumUpdate2ByteAlignedUint16(^b.Checksum(), old, new)))
 }
 
 // SetDestinationPortWithChecksumUpdate implements ChecksummableTransport.
 func (b UDP) SetDestinationPortWithChecksumUpdate(new uint16) {
 	old := b.DestinationPort()
 	b.SetDestinationPort(new)
-	b.SetChecksum(^checksumUpdate2ByteAlignedUint16(^b.Checksum(), old, new))
+	if b.Checksum() == 0 {
+		return
+	}
+	b.SetChecksum(NormalizeUDPChecksum(^checksumUpdate2ByteAlignedUint16(^b.Checksum(), old, new)))
 }
 
 // UpdateChecksumPseudoHeaderAddress implements ChecksummableTransport.
 func (b UDP) UpdateChecksumPseudoHeaderAddress(old, new tcpip.Address, fullChecksum bool) {
 	xsum := b.Checksum()
 	if fullChecksum {
+		if xsum == 0 {
+			return
+		}
 		xsum = ^xsum
 	}
 
 	xsum = checksumUpdate2ByteAlignedAddress(xsum, old, new)
 	if fullChecksum {
-		xsum = ^xsum
+		xsum = NormalizeUDPChecksum(^xsum)
 	}
 
 	b.SetChecksum(xsum)
@@ -175,10 +184,6 @@ func UDPValid(hdr UDP, payloadChecksum func() uint16, payloadSize uint16, netPro
 		return false, false
 	}
 
-	if skipChecksumValidation {
-		return true, true
-	}
-
 	// On IPv4, UDP checksum is optional, and a zero value means the transmitter
 	// omitted the checksum generation, as per RFC 768:
 	//
@@ -190,9 +195,23 @@ func UDPValid(hdr UDP, payloadChecksum func() uint16, payloadSize uint16, netPro
 	//
 	//   Unlike IPv4, when UDP packets are originated by an IPv6 node, the UDP
 	//   checksum is not optional.
-	if netProto == IPv4ProtocolNumber && hdr.Checksum() == 0 {
+	if hdr.Checksum() == 0 {
+		return true, netProto == IPv4ProtocolNumber
+	}
+
+	if skipChecksumValidation {
 		return true, true
 	}
 
 	return true, hdr.IsChecksumValid(srcAddr, dstAddr, payloadChecksum())
+}
+
+// NormalizeUDPChecksum encodes a computed zero checksum as all ones (RFC 768).
+// It must only be applied to complete checksums, not partial checksums or
+// the IPv4 checksum-disabled marker.
+func NormalizeUDPChecksum(xsum uint16) uint16 {
+	if xsum == 0 {
+		return 0xffff
+	}
+	return xsum
 }

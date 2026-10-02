@@ -437,12 +437,16 @@ func coalesceUDPPackets(pkt []byte, item *udpGROItem, bufs [][]byte, bufsOffset 
 		// too small.
 		return coalesceInsufficientCap
 	}
+	// A zero UDP checksum disables checksumming in IPv4 and is invalid in IPv6.
+	// Keep these packets unmerged.
 	if item.numMerged == 0 {
-		if item.cSumKnownInvalid || !checksumValid(bufs[item.bufsIndex][bufsOffset:], item.iphLen, unix.IPPROTO_UDP, isV6) {
+		if item.cSumKnownInvalid || binary.BigEndian.Uint16(pktHead[item.iphLen+6:]) == 0 ||
+			!checksumValid(pktHead, item.iphLen, unix.IPPROTO_UDP, isV6) {
 			return coalesceItemInvalidCSum
 		}
 	}
-	if !checksumValid(pkt, item.iphLen, unix.IPPROTO_UDP, isV6) {
+	if binary.BigEndian.Uint16(pkt[item.iphLen+6:]) == 0 ||
+		!checksumValid(pkt, item.iphLen, unix.IPPROTO_UDP, isV6) {
 		return coalescePktInvalidCSum
 	}
 	extendBy := len(pkt) - int(headersLen)
