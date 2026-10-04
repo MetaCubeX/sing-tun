@@ -133,6 +133,15 @@ func (r *autoRedirect) nftablesCreateLoopbackAddressSets(
 }
 
 func (r *autoRedirect) nftablesCreateExcludeRules(nft *nftables.Conn, table *nftables.Table, chain *nftables.Chain) error {
+	if r.tunOptions.AutoRoute && chain.Hooknum == nftables.ChainHookPrerouting {
+		expressions := nftablesDNATStatusExpressions()
+		expressions = append(expressions, &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictReturn})
+		nft.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: chain,
+			Exprs: expressions,
+		})
+	}
 	if r.tunOptions.AutoRedirectMarkMode && chain.Hooknum == nftables.ChainHookOutput {
 		if chain.Type == nftables.ChainTypeRoute {
 			ipProto := &nftables.Set{
