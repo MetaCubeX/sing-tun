@@ -140,7 +140,7 @@ type Options struct {
 
 func (o *Options) DNSModeOrDefault() string {
 	if o.DNSMode == "" {
-		if o.AutoRoute {
+		if o.AutoRoute && runtime.GOOS != "darwin" {
 			return DNSModeHijack
 		}
 		return DNSModeDisabled

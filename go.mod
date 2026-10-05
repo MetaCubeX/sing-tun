@@ -3,6 +3,7 @@ module github.com/metacubex/sing-tun
 go 1.20
 
 require (
+	github.com/ebitengine/purego v0.10.2
 	github.com/go-ole/go-ole v1.3.0
 	github.com/google/btree v1.1.3
 	github.com/metacubex/fswatch v0.1.1

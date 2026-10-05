@@ -3,6 +3,7 @@ package tun
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -11,8 +12,9 @@ import (
 	"unsafe"
 
 	"github.com/metacubex/sing-tun/internal/gtcpip/header"
-	"github.com/metacubex/sing-tun/internal/rawfile_darwin"
-	"github.com/metacubex/sing-tun/internal/stopfd_darwin"
+	rawfile "github.com/metacubex/sing-tun/internal/rawfile_darwin"
+	stopfd "github.com/metacubex/sing-tun/internal/stopfd_darwin"
+	"github.com/metacubex/sing-tun/internal/systemconfiguration"
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
 	E "github.com/metacubex/sing/common/exceptions"
@@ -27,20 +29,21 @@ var _ DarwinTUN = (*NativeTun)(nil)
 const PacketOffset = 4
 
 type NativeTun struct {
-	tunFd         int
-	tunFile       *os.File
-	batchSize     int
-	iovecs        []iovecBuffer
-	iovecsOutput  []iovecBuffer
-	msgHdrs       []rawfile.MsgHdrX
-	msgHdrsOutput []rawfile.MsgHdrX
-	buffers       []*buf.Buffer
-	stopFd        stopfd.StopFD
-	options       Options
-	inet4Address  [4]byte
-	inet6Address  [16]byte
-	routeSet      bool
-	writeMsgX     bool
+	tunFd           int
+	tunFile         *os.File
+	batchSize       int
+	iovecs          []iovecBuffer
+	iovecsOutput    []iovecBuffer
+	msgHdrs         []rawfile.MsgHdrX
+	msgHdrsOutput   []rawfile.MsgHdrX
+	buffers         []*buf.Buffer
+	stopFd          stopfd.StopFD
+	options         Options
+	inet4Address    [4]byte
+	inet6Address    [16]byte
+	routeSet        bool
+	writeMsgX       bool
+	dnsRegistration io.Closer
 
 	// writeAccess serializes writers on tunFd: sendmsg_x uses MSG_DONTWAIT, so a
 	// concurrent writer holding SB_LOCK makes the kernel free the whole batch yet
@@ -150,6 +153,10 @@ func New(options Options) (Tun, error) {
 	if len(options.Inet6Address) > 0 {
 		nativeTun.inet6Address = options.Inet6Address[0].Addr().As16()
 	}
+	if err := nativeTun.configureDNS(); err != nil {
+		nativeTun.Close()
+		return nil, E.Cause(err, "set DNS")
+	}
 	return nativeTun, nil
 }
 
@@ -177,10 +184,11 @@ func init() {
 
 func (t *NativeTun) Close() error {
 	defer flushDNSCache()
+	dnsErr := common.Close(t.dnsRegistration)
 	t.stopFd.Stop()
 	err := t.tunFile.Close()
 	t.stopFd.Close()
-	return err
+	return E.Errors(dnsErr, err)
 }
 
 const utunControlName = "com.apple.net.utun_control"
@@ -474,6 +482,27 @@ func (t *NativeTun) BatchWrite(buffers []*buf.Buffer) error {
 
 func (t *NativeTun) TXChecksumOffload() bool {
 	return false
+}
+
+func (t *NativeTun) configureDNS() error {
+	// Supplied descriptors are configured by their owner (e.g. NetworkExtension).
+	if t.options.FileDescriptor != 0 || t.options.DNSModeOrDefault() == DNSModeDisabled {
+		return nil
+	}
+	servers, err := t.options.DNSServerAddress()
+	if err != nil {
+		return err
+	}
+	if len(servers) == 0 {
+		return nil
+	}
+	registration, err := systemconfiguration.RegisterDNS(t.options.Name, servers)
+	if err != nil {
+		return err
+	}
+	t.dnsRegistration = registration
+	flushDNSCache()
+	return nil
 }
 
 func useSocket(domain, typ, proto int, block func(socketFd int) error) error {
