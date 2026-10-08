@@ -1,4 +1,4 @@
-//go:build darwin && !ios
+//go:build darwin
 
 package systemconfiguration
 
@@ -7,8 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/ebitengine/purego"
+	"unsafe"
 )
 
 func TestDNSDictionary(t *testing.T) {
@@ -16,21 +15,42 @@ func TestDNSDictionary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cf, err := purego.Dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", purego.RTLD_NOW|purego.RTLD_LOCAL)
+	cf, err := dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer purego.Dlclose(cf)
-	var dictionaryGet func(uintptr, uintptr) uintptr
-	var arrayCount func(uintptr) int
-	var arrayGet func(uintptr, int) uintptr
-	var stringGet func(uintptr, []byte, int, uint32) bool
-	var numberGet func(uintptr, int, *int32) bool
-	purego.RegisterLibFunc(&dictionaryGet, cf, "CFDictionaryGetValue")
-	purego.RegisterLibFunc(&arrayCount, cf, "CFArrayGetCount")
-	purego.RegisterLibFunc(&arrayGet, cf, "CFArrayGetValueAtIndex")
-	purego.RegisterLibFunc(&stringGet, cf, "CFStringGetCString")
-	purego.RegisterLibFunc(&numberGet, cf, "CFNumberGetValue")
+	lookup := func(name string) uintptr {
+		symbol, err := dlsym(cf, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return symbol
+	}
+	cfDictionaryGetValue := lookup("CFDictionaryGetValue")
+	cfArrayGetCount := lookup("CFArrayGetCount")
+	cfArrayGetValueAtIndex := lookup("CFArrayGetValueAtIndex")
+	cfStringGetCString := lookup("CFStringGetCString")
+	cfNumberGetValue := lookup("CFNumberGetValue")
+	dictionaryGet := func(dict, key uintptr) uintptr {
+		value, _, _ := syscall_syscall(cfDictionaryGetValue, dict, key, 0)
+		return value
+	}
+	arrayCount := func(array uintptr) int {
+		count, _, _ := syscall_syscall(cfArrayGetCount, array, 0, 0)
+		return int(count)
+	}
+	arrayGet := func(array uintptr, index int) uintptr {
+		value, _, _ := syscall_syscall(cfArrayGetValueAtIndex, array, uintptr(index), 0)
+		return value
+	}
+	stringGet := func(ref uintptr, buffer []byte, size int, encoding uint32) bool {
+		ok, _, _ := syscall_syscall6(cfStringGetCString, ref, uintptr(unsafe.Pointer(&buffer[0])), uintptr(size), uintptr(encoding), 0, 0)
+		return uint8(ok) != 0
+	}
+	numberGet := func(ref uintptr, numberType int, value *int32) bool {
+		ok, _, _ := syscall_syscall(cfNumberGetValue, ref, uintptr(numberType), uintptr(unsafe.Pointer(value)))
+		return uint8(ok) != 0
+	}
 	for _, servers := range [][]netip.Addr{
 		{netip.MustParseAddr("192.0.2.2")},
 		{netip.MustParseAddr("2001:db8::2")},

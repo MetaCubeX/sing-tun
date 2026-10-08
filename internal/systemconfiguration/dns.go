@@ -1,4 +1,4 @@
-//go:build darwin && !ios
+//go:build darwin
 
 package systemconfiguration
 
@@ -8,8 +8,9 @@ import (
 	"net/netip"
 	"runtime"
 	"sync"
+	"unsafe"
 
-	"github.com/ebitengine/purego"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -81,51 +82,89 @@ func loadFrameworkAPI() (*frameworkFunctions, error) {
 }
 
 func (f *frameworkFunctions) load() error {
-	// Keep the frameworks loaded for the lifetime of the process: the registered
+	// Keep the frameworks loaded for the lifetime of the process: the bound
 	// functions and CoreFoundation collection callbacks point into them.
-	cf, err := purego.Dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", purego.RTLD_NOW|purego.RTLD_LOCAL)
+	cf, err := dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
 	if err != nil {
 		return err
 	}
-	sc, err := purego.Dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", purego.RTLD_NOW|purego.RTLD_LOCAL)
+	sc, err := dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration")
 	if err != nil {
 		return err
 	}
 
+	var (
+		cfStringCreateWithCString       uintptr
+		cfArrayCreate                   uintptr
+		cfDictionaryCreate              uintptr
+		cfNumberCreate                  uintptr
+		cfRelease                       uintptr
+		scDynamicStoreCreate            uintptr
+		scDynamicStoreAddTemporaryValue uintptr
+		scError                         uintptr
+		scErrorString                   uintptr
+	)
 	for _, binding := range []struct {
 		library uintptr
 		name    string
-		fn      any
+		ptr     *uintptr
 	}{
-		{cf, "CFStringCreateWithCString", &f.cfStringCreateWithCString},
-		{cf, "CFArrayCreate", &f.cfArrayCreate},
-		{cf, "CFDictionaryCreate", &f.cfDictionaryCreate},
-		{cf, "CFNumberCreate", &f.cfNumberCreate},
-		{cf, "CFRelease", &f.cfRelease},
-		{sc, "SCDynamicStoreCreate", &f.scDynamicStoreCreate},
-		{sc, "SCDynamicStoreAddTemporaryValue", &f.scDynamicStoreAddTemporaryValue},
-		{sc, "SCError", &f.scError},
-		{sc, "SCErrorString", &f.scErrorString},
+		{cf, "CFStringCreateWithCString", &cfStringCreateWithCString},
+		{cf, "CFArrayCreate", &cfArrayCreate},
+		{cf, "CFDictionaryCreate", &cfDictionaryCreate},
+		{cf, "CFNumberCreate", &cfNumberCreate},
+		{cf, "CFRelease", &cfRelease},
+		{cf, "kCFTypeArrayCallBacks", &f.cfTypeArrayCallbacks},
+		{cf, "kCFTypeDictionaryKeyCallBacks", &f.cfTypeDictionaryKeyCallbacks},
+		{cf, "kCFTypeDictionaryValueCallBacks", &f.cfTypeDictionaryValueCallbacks},
+		{sc, "SCDynamicStoreCreate", &scDynamicStoreCreate},
+		{sc, "SCDynamicStoreAddTemporaryValue", &scDynamicStoreAddTemporaryValue},
+		{sc, "SCError", &scError},
+		{sc, "SCErrorString", &scErrorString},
 	} {
-		symbol, err := purego.Dlsym(binding.library, binding.name)
+		*binding.ptr, err = dlsym(binding.library, binding.name)
 		if err != nil {
 			return err
 		}
-		purego.RegisterFunc(binding.fn, symbol)
 	}
 
-	for _, binding := range []struct {
-		name string
-		ptr  *uintptr
-	}{
-		{"kCFTypeArrayCallBacks", &f.cfTypeArrayCallbacks},
-		{"kCFTypeDictionaryKeyCallBacks", &f.cfTypeDictionaryKeyCallbacks},
-		{"kCFTypeDictionaryValueCallBacks", &f.cfTypeDictionaryValueCallbacks},
-	} {
-		*binding.ptr, err = purego.Dlsym(cf, binding.name)
-		if err != nil {
-			return err
-		}
+	f.cfStringCreateWithCString = func(allocator uintptr, value string, encoding uint32) uintptr {
+		cString := append([]byte(value), 0)
+		ref, _, _ := syscall_syscall(cfStringCreateWithCString, allocator, uintptr(unsafe.Pointer(&cString[0])), uintptr(encoding))
+		return ref
+	}
+	f.cfArrayCreate = func(allocator uintptr, values []uintptr, count int, callbacks uintptr) uintptr {
+		ref, _, _ := syscall_syscall6(cfArrayCreate, allocator, uintptr(unsafe.Pointer(unsafe.SliceData(values))), uintptr(count), callbacks, 0, 0)
+		return ref
+	}
+	f.cfDictionaryCreate = func(allocator uintptr, keys []uintptr, values []uintptr, count int, keyCallbacks uintptr, valueCallbacks uintptr) uintptr {
+		ref, _, _ := syscall_syscall6(cfDictionaryCreate, allocator, uintptr(unsafe.Pointer(unsafe.SliceData(keys))), uintptr(unsafe.Pointer(unsafe.SliceData(values))), uintptr(count), keyCallbacks, valueCallbacks)
+		return ref
+	}
+	f.cfNumberCreate = func(allocator uintptr, numberType int, value *int32) uintptr {
+		ref, _, _ := syscall_syscall(cfNumberCreate, allocator, uintptr(numberType), uintptr(unsafe.Pointer(value)))
+		return ref
+	}
+	f.cfRelease = func(ref uintptr) {
+		syscall_syscall(cfRelease, ref, 0, 0)
+	}
+	f.scDynamicStoreCreate = func(allocator, name, callout, context uintptr) uintptr {
+		ref, _, _ := syscall_syscall6(scDynamicStoreCreate, allocator, name, callout, context, 0, 0)
+		return ref
+	}
+	f.scDynamicStoreAddTemporaryValue = func(store, key, value uintptr) bool {
+		ok, _, _ := syscall_syscall(scDynamicStoreAddTemporaryValue, store, key, value)
+		// Boolean is an unsigned char; the upper bits of the register are undefined.
+		return uint8(ok) != 0
+	}
+	f.scError = func() int32 {
+		code, _, _ := syscall_syscall(scError, 0, 0, 0)
+		return int32(code)
+	}
+	f.scErrorString = func(code int32) string {
+		message, _, _ := syscall_syscall(scErrorString, uintptr(code), 0, 0)
+		// message points to a static C string owned by SystemConfiguration.
+		return unix.BytePtrToString(*(**byte)(unsafe.Pointer(&message)))
 	}
 
 	return nil
