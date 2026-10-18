@@ -418,7 +418,7 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	if t.options.DNSModeOrDefault() != DNSModeDisabled {
 		err = t.setSearchDomainForSystemdResolved()
 		if err != nil {
-			return E.Cause(err, "set search domain")
+			return E.Errors(E.Cause(err, "set search domain"), t.unsetRules(), t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
 		}
 	}
 	if t.ipvsDNSBypass != nil {
