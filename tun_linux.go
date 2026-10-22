@@ -33,6 +33,8 @@ type NativeTun struct {
 	tunFile           *os.File
 	interfaceCallback *list.Element[DefaultInterfaceUpdateCallback]
 	options           Options
+	dnatBypass        *autoRouteDNATBypass
+	ipvsDNSBypass     *autoRouteIPVSDNSBypass
 	ruleIndex6        []int
 	readAccess        sync.Mutex
 	writeAccess       sync.Mutex
@@ -390,27 +392,37 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 		}
 	}
 
+	if t.options.AutoRoute && runtime.GOOS != "android" {
+		t.enableAutoRouteDNATBypass(prepareAutoRouteDNATBypass)
+		if !t.options.AutoRedirectMarkMode {
+			t.enableAutoRouteIPVSDNSBypass(ipvsTablePath)
+		}
+	}
+
 	err = t.setRoute(tunLink)
 	if err != nil {
 		_ = t.unsetRoute0(tunLink)
-		return err
+		return E.Errors(err, common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
 
 	err = t.unsetRules()
 	if err != nil {
-		return E.Cause(err, "cleanup rules")
+		return E.Errors(E.Cause(err, "cleanup rules"), t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
 	err = t.setRules()
 	if err != nil {
 		_ = t.unsetRules()
-		return err
+		return E.Errors(err, t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
 
 	if t.options.DNSModeOrDefault() != DNSModeDisabled {
 		err = t.setSearchDomainForSystemdResolved()
 		if err != nil {
-			return E.Cause(err, "set search domain")
+			return E.Errors(E.Cause(err, "set search domain"), t.unsetRules(), t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
 		}
+	}
+	if t.ipvsDNSBypass != nil {
+		t.ipvsDNSBypass.Start(t.refreshIPVSDNSBypass)
 	}
 
 	if t.options.AutoRoute && runtime.GOOS == "android" {
@@ -443,6 +455,9 @@ func (t *NativeTun) enableGSO() error {
 }
 
 func (t *NativeTun) Close() error {
+	if t.ipvsDNSBypass != nil {
+		t.ipvsDNSBypass.Close()
+	}
 	if t.interfaceCallback != nil {
 		t.options.InterfaceMonitor.UnregisterCallback(t.interfaceCallback)
 	}
@@ -450,7 +465,7 @@ func (t *NativeTun) Close() error {
 		t.unsetSearchDomainForSystemdResolved()
 	}
 	t.unsetAddresses()
-	return E.Errors(t.unsetRoute(), t.unsetRules(), common.Close(common.PtrOrNil(t.tunFile)))
+	return E.Errors(t.unsetRules(), t.unsetRoute(), common.Close(common.PtrOrNil(t.dnatBypass)), common.Close(common.PtrOrNil(t.tunFile)))
 }
 
 func (t *NativeTun) TXChecksumOffload() bool {
@@ -534,6 +549,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	var it *netlink.Rule
 
 	excludeRanges := t.options.ExcludedRanges()
+	dnatBypassMarkMask := int(t.options.autoRouteDNATBypassMask())
 
 	ruleStart := t.options.IPRoute2RuleIndex
 	priority := ruleStart
@@ -544,6 +560,10 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it = netlink.NewRule()
 			it.Priority = priority
 			it.Mark = t.options.AutoRedirectOutputMark
+			if t.dnatBypass != nil {
+				it.Mark = t.options.autoRouteDNATBypassMark()
+				it.Mask = dnatBypassMarkMask
+			}
 			it.MarkSet = true
 			it.Goto = priority + 2
 			it.Family = unix.AF_INET
@@ -568,6 +588,10 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it = netlink.NewRule()
 			it.Priority = priority6
 			it.Mark = t.options.AutoRedirectOutputMark
+			if t.dnatBypass != nil {
+				it.Mark = t.options.autoRouteDNATBypassMark()
+				it.Mask = dnatBypassMarkMask
+			}
 			it.MarkSet = true
 			it.Goto = priority6 + 2
 			it.Family = unix.AF_INET6
@@ -608,6 +632,51 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	}
 
 	nopPriority := ruleStart + 10
+	if t.dnatBypass != nil {
+		if p4 {
+			it = netlink.NewRule()
+			it.Priority = priority
+			it.Mark = t.options.autoRouteDNATBypassMark()
+			it.Mask = dnatBypassMarkMask
+			it.MarkSet = true
+			it.Goto = nopPriority
+			it.Family = unix.AF_INET
+			rules = append(rules, it)
+			priority++
+		}
+		if p6 {
+			it = netlink.NewRule()
+			it.Priority = priority6
+			it.Mark = t.options.autoRouteDNATBypassMark()
+			it.Mask = dnatBypassMarkMask
+			it.MarkSet = true
+			it.Goto = nopPriority
+			it.Family = unix.AF_INET6
+			rules = append(rules, it)
+			priority6++
+		}
+	}
+	if t.ipvsDNSBypass != nil {
+		var added4, added6 bool
+		for _, destination := range t.ipvsDNSBypass.Destinations() {
+			it = t.ipvsDNSRule(destination)
+			if it == nil {
+				continue
+			}
+			rules = append(rules, it)
+			if destination.address.Is4() {
+				added4 = true
+			} else {
+				added6 = true
+			}
+		}
+		if added4 {
+			priority++
+		}
+		if added6 {
+			priority6++
+		}
+	}
 	for _, excludePort := range t.options.ExcludeSrcPort {
 		if p4 {
 			it = netlink.NewRule()
