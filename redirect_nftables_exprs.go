@@ -149,17 +149,22 @@ func nftablesCreateIPSet(
 		if (family == nftables.TableFamilyIPv4) != rr.From().Is4() {
 			continue
 		}
-		endAddr := rr.To().Next()
-		if !endAddr.IsValid() {
-			endAddr = rr.From()
-		}
 		setElements = append(setElements, nftables.SetElement{
 			Key: rr.From().AsSlice(),
 		})
-		setElements = append(setElements, nftables.SetElement{
-			Key:         endAddr.AsSlice(),
-			IntervalEnd: true,
-		})
+		// The interval end marker must be the address right after the last
+		// address of the range. When the range ends at the maximum address of
+		// the family there is no such address: the start element alone already
+		// means "up to the end of the address space". Emitting a marker with
+		// the same key as the start element instead makes the kernel reject the
+		// whole netlink message with EEXIST, which silently dropped up to 999
+		// elements of the set (MetaCubeX/mihomo#3284).
+		if endAddr := rr.To().Next(); endAddr.IsValid() {
+			setElements = append(setElements, nftables.SetElement{
+				Key:         endAddr.AsSlice(),
+				IntervalEnd: true,
+			})
+		}
 	}
 	if appendDefault && len(setElements) == 0 {
 		if family == nftables.TableFamilyIPv4 {
