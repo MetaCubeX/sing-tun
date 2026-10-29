@@ -20,8 +20,8 @@ github.com/metacubex/mipstack v0.0.0-20261019124225-9a80a07eaeb9 h1:/uFijgwBH3L7
 github.com/metacubex/mipstack v0.0.0-20261019124225-9a80a07eaeb9/go.mod h1:+bbwALZI0pbi2auSG5A3ptdpV2DZ2eLObziXo+P7oj0=
 github.com/metacubex/nftables v0.0.0-20260426003805-208c2c1ba2cb h1:wk6mHYPURSUvWcUv72gNP79oiylFsscBSDPJ6ieV6Iw=
 github.com/metacubex/nftables v0.0.0-20260426003805-208c2c1ba2cb/go.mod h1:73ZrCfhdkW4F2E2GAlta3km/S2RHhFNogCMtWZV2anQ=
-github.com/metacubex/sing v0.5.8 h1:OwJDSPP+pza6Ywt7NMR4kEYq+UNrsIywSk/eAMlqxz8=
-github.com/metacubex/sing v0.5.8/go.mod h1:ypf0mjwlZm0sKdQSY+yQvmsbWa0hNPtkeqyRMGgoN+w=
+github.com/metacubex/sing v0.5.9 h1:R4JVFIHnkbRsvvrZs/sYAdoZ9K/P6DqlD8ZoSQAejFs=
+github.com/metacubex/sing v0.5.9/go.mod h1:ynXUNwUt4dfOFO805EWzw3ORmNWXoexziwn5XYCfsq8=
 github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a h1:ObwtHN2VpqE0ZNjr6sGeT00J8uU7JF4cNUdb44/Duis=
 github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a/go.mod h1:xLnfdiJbSp8rNqYEdIW/6eDO4mVoogml14Bh2hSiFpM=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=

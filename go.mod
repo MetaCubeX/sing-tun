@@ -9,7 +9,7 @@ require (
 	github.com/metacubex/gvisor v0.0.0-20260922041103-e2cbcd6e7400
 	github.com/metacubex/mipstack v0.0.0-20261019124225-9a80a07eaeb9
 	github.com/metacubex/nftables v0.0.0-20260426003805-208c2c1ba2cb
-	github.com/metacubex/sing v0.5.8
+	github.com/metacubex/sing v0.5.9
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a
 	github.com/stretchr/testify v1.12.1
 	go4.org/netipx v0.0.0-20260823151212-3075585bcbeb
