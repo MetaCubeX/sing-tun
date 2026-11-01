@@ -432,6 +432,7 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 		}
 	}
 	if t.ipvsDNSBypass != nil {
+		t.refreshIPVSDNSBypass()
 		t.ipvsDNSBypass.Start(t.refreshIPVSDNSBypass)
 	}
 

@@ -31,10 +31,10 @@ TCP  [fd00::a]:0035 rr
 `))
 	require.NoError(t, err)
 	require.Equal(t, []ipvsDNSDestination{
-		{protocol: unix.IPPROTO_TCP, address: netip.MustParseAddr("10.122.219.70")},
-		{protocol: unix.IPPROTO_TCP, address: netip.MustParseAddr("10.122.219.71")},
-		{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.71")},
-		{protocol: unix.IPPROTO_TCP, address: netip.MustParseAddr("fd00::46")},
+		{protocol: unix.IPPROTO_TCP, endpoint: netip.MustParseAddrPort("10.122.219.70:53")},
+		{protocol: unix.IPPROTO_TCP, endpoint: netip.MustParseAddrPort("10.122.219.71:53")},
+		{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.71:53")},
+		{protocol: unix.IPPROTO_TCP, endpoint: netip.MustParseAddrPort("[fd00::46]:53")},
 	}, destinations)
 }
 
@@ -42,7 +42,7 @@ func TestAutoRouteIPVSDNSBypassRule(t *testing.T) {
 	nativeTun := &NativeTun{
 		ipvsDNSBypass: &autoRouteIPVSDNSBypass{
 			destinations: []ipvsDNSDestination{
-				{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.70")},
+				{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.70:53")},
 			},
 		},
 		options: Options{
@@ -69,8 +69,8 @@ func TestAutoRouteIPVSDNSBypassRule(t *testing.T) {
 }
 
 func TestIPVSDNSDestinationsChanged(t *testing.T) {
-	oldDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.70")}}
-	newDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.71")}}
+	oldDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.70:53")}}
+	newDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.71:53")}}
 	require.False(t, ipvsDNSDestinationsChanged(oldDestinations, oldDestinations))
 	require.True(t, ipvsDNSDestinationsChanged(oldDestinations, newDestinations))
 }
@@ -80,14 +80,14 @@ func TestAutoRouteIPVSDNSBypassReload(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("UDP  0A0A000A:0035 rr\n  -> 0A7ADB46:0035 Masq 1 0 0\n"), 0o600))
 	bypass, err := newAutoRouteIPVSDNSBypass(path)
 	require.NoError(t, err)
-	require.Equal(t, []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.70")}}, bypass.Destinations())
+	require.Equal(t, []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.70:53")}}, bypass.Destinations())
 
 	require.NoError(t, os.WriteFile(path, []byte("UDP  0A0A000A:0035 rr\n  -> 0A7ADB47:0035 Masq 1 0 0\n"), 0o600))
 	destinations, err := bypass.Load()
 	require.NoError(t, err)
 	require.True(t, ipvsDNSDestinationsChanged(bypass.Destinations(), destinations))
 	bypass.Replace(destinations)
-	require.Equal(t, []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.71")}}, bypass.Destinations())
+	require.Equal(t, []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.71:53")}}, bypass.Destinations())
 }
 
 func TestAutoRouteIPVSDNSBypassMissingTable(t *testing.T) {
@@ -100,13 +100,13 @@ func TestAutoRouteIPVSDNSBypassMissingTable(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("UDP  0A0A000A:0035 rr\n  -> 0A7ADB46:0035 Masq 1 0 0\n"), 0o600))
 	destinations, err := bypass.Load()
 	require.NoError(t, err)
-	require.Equal(t, []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.70")}}, destinations)
+	require.Equal(t, []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.70:53")}}, destinations)
 }
 
 func TestUpdateIPVSDNSRulesUsesExactDifference(t *testing.T) {
 	nativeTun := newIPVSDNSRuleTestTun()
-	oldDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.70")}}
-	newDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_TCP, address: netip.MustParseAddr("10.122.219.71")}}
+	oldDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.70:53")}}
+	newDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_TCP, endpoint: netip.MustParseAddrPort("10.122.219.71:53")}}
 	var operations []string
 	updatedDestinations, err := nativeTun.updateIPVSDNSRules(oldDestinations, newDestinations,
 		func(rule *netlink.Rule) error {
@@ -127,8 +127,8 @@ func TestUpdateIPVSDNSRulesUsesExactDifference(t *testing.T) {
 
 func TestUpdateIPVSDNSRulesKeepsOldRulesWhenAddFails(t *testing.T) {
 	nativeTun := newIPVSDNSRuleTestTun()
-	oldDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.70")}}
-	newDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.71")}}
+	oldDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.70:53")}}
+	newDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.71:53")}}
 	deleteCalls := 0
 	updatedDestinations, err := nativeTun.updateIPVSDNSRules(oldDestinations, newDestinations,
 		func(*netlink.Rule) error { return errors.New("add failed") },
@@ -137,15 +137,15 @@ func TestUpdateIPVSDNSRulesKeepsOldRulesWhenAddFails(t *testing.T) {
 			return nil
 		},
 	)
-	require.EqualError(t, err, "add IPVS DNS bypass rule for 10.122.219.71: add failed")
+	require.EqualError(t, err, "add IPVS DNS bypass rule for 10.122.219.71:53: add failed")
 	require.Zero(t, deleteCalls)
 	require.Equal(t, oldDestinations, updatedDestinations)
 }
 
 func TestUpdateIPVSDNSRulesTracksPartialUpdate(t *testing.T) {
 	nativeTun := newIPVSDNSRuleTestTun()
-	first := ipvsDNSDestination{protocol: unix.IPPROTO_TCP, address: netip.MustParseAddr("10.122.219.70")}
-	second := ipvsDNSDestination{protocol: unix.IPPROTO_UDP, address: netip.MustParseAddr("10.122.219.71")}
+	first := ipvsDNSDestination{protocol: unix.IPPROTO_TCP, endpoint: netip.MustParseAddrPort("10.122.219.70:53")}
+	second := ipvsDNSDestination{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.71:53")}
 	addCalls := 0
 	updatedDestinations, err := nativeTun.updateIPVSDNSRules(nil, []ipvsDNSDestination{first, second},
 		func(*netlink.Rule) error {
@@ -157,7 +157,7 @@ func TestUpdateIPVSDNSRulesTracksPartialUpdate(t *testing.T) {
 		},
 		func(*netlink.Rule) error { return nil },
 	)
-	require.EqualError(t, err, "add IPVS DNS bypass rule for 10.122.219.71: add failed")
+	require.EqualError(t, err, "add IPVS DNS bypass rule for 10.122.219.71:53: add failed")
 	require.Equal(t, []ipvsDNSDestination{first}, updatedDestinations)
 
 	deleteCalls := 0
@@ -171,7 +171,7 @@ func TestUpdateIPVSDNSRulesTracksPartialUpdate(t *testing.T) {
 			return nil
 		},
 	)
-	require.EqualError(t, err, "delete IPVS DNS bypass rule for 10.122.219.71: delete failed")
+	require.EqualError(t, err, "delete IPVS DNS bypass rule for 10.122.219.71:53: delete failed")
 	require.Equal(t, []ipvsDNSDestination{second}, updatedDestinations)
 }
 
@@ -185,4 +185,27 @@ func newIPVSDNSRuleTestTun() *NativeTun {
 			Inet4Gateway:      netip.MustParseAddr("198.18.0.2"),
 		},
 	}
+}
+
+func TestIPVSDNSBackendPortRules(t *testing.T) {
+	const table = `UDP  0A60000A:0035 rr
+  -> 0AF40035:041D Masq 1 0 0
+  -> 0AF40035:0035 Masq 1 0 0
+  -> 0AF40035:0000 Masq 1 0 0
+TCP  0A60000A:0035 rr
+  -> 0AF40035:041D Masq 1 0 0
+TCP  0A60000A:0050 rr
+  -> 0AF40035:1F90 Masq 1 0 0
+`
+	backends, err := parseIPVSDNSDestinations(strings.NewReader(table))
+	require.NoError(t, err)
+	n := newIPVSDNSRuleTestTun()
+	var targets [][2]int
+	for _, backend := range backends {
+		rule := n.ipvsDNSRule(backend)
+		require.Equal(t, netip.MustParsePrefix("10.244.0.53/32"), rule.Dst)
+		targets = append(targets, [2]int{rule.IPProto, int(rule.Dport.Start)})
+		require.Equal(t, rule.Dport.Start, rule.Dport.End)
+	}
+	require.ElementsMatch(t, [][2]int{{unix.IPPROTO_UDP, 53}, {unix.IPPROTO_UDP, 1053}, {unix.IPPROTO_TCP, 1053}}, targets)
 }

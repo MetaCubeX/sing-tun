@@ -38,7 +38,7 @@ type autoRouteIPVSDNSBypass struct {
 
 type ipvsDNSDestination struct {
 	protocol int
-	address  netip.Addr
+	endpoint netip.AddrPort
 }
 
 func newAutoRouteIPVSDNSBypass(path string) (*autoRouteIPVSDNSBypass, error) {
@@ -131,16 +131,15 @@ func (t *NativeTun) refreshIPVSDNSBypass() {
 		return
 	}
 	oldDestinations := t.ipvsDNSBypass.Destinations()
-	if !ipvsDNSDestinationsChanged(oldDestinations, newDestinations) {
-		return
+	if ipvsDNSDestinationsChanged(oldDestinations, newDestinations) {
+		var installed []ipvsDNSDestination
+		installed, err = t.updateIPVSDNSRules(oldDestinations, newDestinations, addIPVSDNSRule, deleteIPVSDNSRule)
+		t.ipvsDNSBypass.Replace(installed)
+	} else if t.dnatBypass != nil {
+		err = t.dnatBypass.updateIPVSDNSOutput(newDestinations)
 	}
-	updatedDestinations, err := t.updateIPVSDNSRules(oldDestinations, newDestinations, addIPVSDNSRule, deleteIPVSDNSRule)
-	t.ipvsDNSBypass.Replace(updatedDestinations)
-	if err != nil {
-		if t.options.Logger != nil {
-			t.options.Logger.Error(E.Cause(err, "update auto-route IPVS DNS bypass"))
-		}
-		return
+	if err != nil && t.options.Logger != nil {
+		t.options.Logger.Error(E.Cause(err, "update auto-route IPVS DNS bypass"))
 	}
 }
 
@@ -158,16 +157,23 @@ func (t *NativeTun) updateIPVSDNSRules(
 		rule := t.ipvsDNSRule(destination)
 		if rule != nil {
 			if err := addRule(rule); err != nil {
-				return sortedIPVSDNSDestinations(currentDestinations), E.Cause(err, "add IPVS DNS bypass rule for ", destination.address)
+				return sortedIPVSDNSDestinations(currentDestinations), E.Cause(err, "add IPVS DNS bypass rule for ", destination.endpoint)
 			}
 		}
 		currentDestinations[destination] = struct{}{}
+	}
+	// Only re-route packets after their lookup rules exist. Keep the old rules
+	// until the firewall has stopped selecting those endpoints.
+	if t.dnatBypass != nil {
+		if err := t.dnatBypass.updateIPVSDNSOutput(newDestinations); err != nil {
+			return sortedIPVSDNSDestinations(currentDestinations), E.Cause(err, "replace IPVS DNS output rules")
+		}
 	}
 	for _, destination := range ipvsDNSDestinationDifference(oldDestinations, newDestinations) {
 		rule := t.ipvsDNSRule(destination)
 		if rule != nil {
 			if err := deleteRule(rule); err != nil {
-				return sortedIPVSDNSDestinations(currentDestinations), E.Cause(err, "delete IPVS DNS bypass rule for ", destination.address)
+				return sortedIPVSDNSDestinations(currentDestinations), E.Cause(err, "delete IPVS DNS bypass rule for ", destination.endpoint)
 			}
 		}
 		delete(currentDestinations, destination)
@@ -177,7 +183,7 @@ func (t *NativeTun) updateIPVSDNSRules(
 
 func (t *NativeTun) ipvsDNSRule(destination ipvsDNSDestination) *netlink.Rule {
 	rule := netlink.NewRule()
-	if destination.address.Is4() {
+	if destination.endpoint.Addr().Is4() {
 		if len(t.options.Inet4Address) == 0 {
 			return nil
 		}
@@ -192,9 +198,9 @@ func (t *NativeTun) ipvsDNSRule(destination ipvsDNSDestination) *netlink.Rule {
 	if t.dnatBypass != nil {
 		rule.Priority++
 	}
-	rule.Dst = netip.PrefixFrom(destination.address, destination.address.BitLen())
+	rule.Dst = netip.PrefixFrom(destination.endpoint.Addr(), destination.endpoint.Addr().BitLen())
 	rule.IPProto = destination.protocol
-	rule.Dport = netlink.NewRulePortRange(53, 53)
+	rule.Dport = netlink.NewRulePortRange(destination.endpoint.Port(), destination.endpoint.Port())
 	rule.Goto = t.options.IPRoute2RuleIndex + 10
 	return rule
 }
@@ -252,8 +258,11 @@ func parseIPVSDNSDestinations(reader io.Reader) ([]ipvsDNSDestination, error) {
 				continue
 			}
 			address, port, parseErr := parseIPVSAddressPort(fields[1])
-			if parseErr == nil && port == 53 {
-				destinationSet[ipvsDNSDestination{protocol: dnsProtocol, address: address}] = struct{}{}
+			if parseErr == nil {
+				if port == 0 {
+					port = 53
+				} // IPVS retains the virtual port when no backend port is set.
+				destinationSet[ipvsDNSDestination{protocol: dnsProtocol, endpoint: netip.AddrPortFrom(address, port)}] = struct{}{}
 			}
 		default:
 			dnsProtocol = 0
@@ -271,11 +280,14 @@ func sortedIPVSDNSDestinations(destinationSet map[ipvsDNSDestination]struct{}) [
 		destinations = append(destinations, destination)
 	}
 	sort.Slice(destinations, func(i, j int) bool {
-		addressCompare := destinations[i].address.Compare(destinations[j].address)
-		if addressCompare == 0 {
+		addressCompare := destinations[i].endpoint.Addr().Compare(destinations[j].endpoint.Addr())
+		if addressCompare != 0 {
+			return addressCompare < 0
+		}
+		if destinations[i].protocol != destinations[j].protocol {
 			return destinations[i].protocol < destinations[j].protocol
 		}
-		return addressCompare < 0
+		return destinations[i].endpoint.Port() < destinations[j].endpoint.Port()
 	})
 	return destinations
 }

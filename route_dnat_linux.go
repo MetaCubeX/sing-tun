@@ -38,6 +38,7 @@ type autoRouteDNATBypass struct {
 	useNFTables   bool
 	iptablesPath  string
 	ip6tablesPath string
+	ipvsOutput    [2][]ipvsDNSDestination
 }
 
 func (t *NativeTun) enableAutoRouteDNATBypass(
@@ -150,10 +151,16 @@ func (b *autoRouteDNATBypass) Start() error {
 }
 
 func (b *autoRouteDNATBypass) Close() error {
+	var err error
 	if b.useNFTables {
-		return b.cleanupNFTables()
+		err = b.cleanupNFTables()
+	} else {
+		err = b.cleanupIPTables()
 	}
-	return b.cleanupIPTables()
+	if err == nil {
+		b.ipvsOutput = [2][]ipvsDNSDestination{}
+	}
+	return err
 }
 
 func enableSrcValidMark(confPath string, log logger.Logger) error {
@@ -277,7 +284,6 @@ func deleteRouteNFTTable(family nftables.TableFamily, name string) error {
 
 func dnatMarkExpressions(options *Options) []expr.Any {
 	expressions := nftablesDNATStatusExpressions()
-	markMask := options.autoRouteDNATBypassMask()
 	if options.AutoRedirectMarkMode {
 		expressions = append(expressions,
 			&expr.Meta{
@@ -291,6 +297,10 @@ func dnatMarkExpressions(options *Options) []expr.Any {
 			},
 		)
 	}
+	return appendRouteMark(expressions, options.autoRouteDNATBypassMask(), options.autoRouteDNATBypassMark())
+}
+
+func appendRouteMark(expressions []expr.Any, clearMask, xorMask uint32) []expr.Any {
 	return append(expressions,
 		&expr.Meta{
 			Key:      expr.MetaKeyMARK,
@@ -300,8 +310,8 @@ func dnatMarkExpressions(options *Options) []expr.Any {
 			SourceRegister: 1,
 			DestRegister:   1,
 			Len:            4,
-			Mask:           binaryutil.NativeEndian.PutUint32(^markMask),
-			Xor:            binaryutil.NativeEndian.PutUint32(options.autoRouteDNATBypassMark()),
+			Mask:           binaryutil.NativeEndian.PutUint32(^clearMask),
+			Xor:            binaryutil.NativeEndian.PutUint32(xorMask),
 		},
 		&expr.Meta{
 			Key:            expr.MetaKeyMARK,
@@ -346,7 +356,7 @@ func (b *autoRouteDNATBypass) cleanupIPTables() error {
 	var errs []error
 	for _, path := range []string{b.iptablesPath, b.ip6tablesPath} {
 		if path != "" {
-			errs = append(errs, cleanupIPTablesChain(path, "mangle", "PREROUTING", b.chainName))
+			errs = append(errs, cleanupIPTablesChain(path, "mangle", "PREROUTING", b.chainName), cleanupIPTablesChain(path, "mangle", "OUTPUT", b.ipvsOutputChain()))
 		}
 	}
 	return errors.Join(errs...)
