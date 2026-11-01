@@ -5,10 +5,12 @@ package tun
 import (
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/metacubex/sing/common/ranges"
 	"github.com/stretchr/testify/require"
 )
 
@@ -90,4 +92,25 @@ func TestAutoRedirectIPTablesLocalDestinationOrder(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIPTablesMaxIncludeUID(t *testing.T) {
+	if os.Getenv("SING_TUN_INTEGRATION") != "1" {
+		t.Skip("requires CAP_NET_ADMIN in an isolated network namespace")
+	}
+	path, err := exec.LookPath("iptables")
+	require.NoError(t, err)
+	r := &autoRedirect{
+		iptablesPath: path, enableIPv4: true, tableName: "uid-test", customRedirectPort: 1234,
+		tunOptions: &Options{
+			Name: "tun0", AutoRoute: true,
+			Inet4Address: []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
+			IncludeUID:   []ranges.Range[uint32]{{Start: 0xfffffffe, End: 0xffffffff}},
+		},
+	}
+	t.Cleanup(r.cleanupIPTables)
+	require.NoError(t, r.setupIPTablesForFamily(path))
+	output, err := exec.Command(path, "-t", "nat", "-S", "uid-test-output").CombinedOutput()
+	require.NoError(t, err, string(output))
+	require.Contains(t, string(output), "-o tun0")
 }

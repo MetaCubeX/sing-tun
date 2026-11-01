@@ -20,14 +20,16 @@ func TestConfigureDNSFailureCleansAutoRoute(t *testing.T) {
 		t.Skip("requires a Linux network namespace with CAP_NET_ADMIN")
 	}
 	for name, testCase := range map[string]struct {
-		address  string
-		markMode bool
-		dns      []netip.Addr
+		address          string
+		markMode         bool
+		dns              []netip.Addr
+		includeInterface bool
 	}{
-		"IPv4":      {address: "198.18.0.1/32"},
-		"IPv6":      {address: "fd00::1/128"},
-		"mark mode": {address: "fd00::1/128", markMode: true},
-		"valid DNS": {address: "fd00::1/128", dns: []netip.Addr{netip.MustParseAddr("fd00::2")}},
+		"IPv4":                   {address: "198.18.0.1/32"},
+		"IPv6":                   {address: "fd00::1/128"},
+		"mark mode":              {address: "fd00::1/128", markMode: true},
+		"valid DNS":              {address: "fd00::1/128", dns: []netip.Addr{netip.MustParseAddr("fd00::2")}},
+		"IPv6 include interface": {address: "fd00::1/128", dns: []netip.Addr{netip.MustParseAddr("fd00::2")}, includeInterface: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			binDir := t.TempDir()
@@ -51,6 +53,9 @@ func TestConfigureDNSFailureCleansAutoRoute(t *testing.T) {
 				Logger:                                logger.NOP(),
 			}}
 			address := netip.MustParsePrefix(testCase.address)
+			if testCase.includeInterface {
+				nativeTun.options.IncludeInterface = []string{"lo"}
+			}
 			if address.Addr().Is4() {
 				nativeTun.options.Inet4Address = []netip.Prefix{address}
 			} else {
