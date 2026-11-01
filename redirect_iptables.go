@@ -145,41 +145,8 @@ func (r *autoRedirect) setupIPTablesForFamily(iptablesPath string) error {
 		}
 	}
 	if r.tunOptions.DNSModeOrDefault() == DNSModeHijack {
-		var dnsServers []netip.Addr
-		if iptablesPath == r.iptablesPath {
-			dnsServers, err = r.tunOptions.Inet4DNSAddress()
-		} else {
-			dnsServers, err = r.tunOptions.Inet6DNSAddress()
-		}
-		if err != nil {
+		if err = r.iptablesCreateDNSHijackRules(iptablesPath, tableNamePreRouteing, routeAddress); err != nil {
 			return err
-		}
-		if len(dnsServers) > 0 {
-			dnsServer := dnsServers[0]
-			if len(routeAddress) > 0 {
-				for _, address := range routeAddress {
-					err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing,
-						"-d", address.String(), "-p udp --dport 53 -j DNAT --to", dnsServer)
-					if err != nil {
-						return err
-					}
-				}
-			} else if len(r.tunOptions.IncludeInterface) > 0 || len(r.tunOptions.IncludeUID) > 0 {
-				for _, name := range r.tunOptions.IncludeInterface {
-					err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing,
-						"-i", name, "-p udp --dport 53 -j DNAT --to", dnsServer)
-					if err != nil {
-						return err
-					}
-				}
-
-			} else {
-				err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing,
-					"-p udp --dport 53 -j DNAT --to", dnsServer)
-				if err != nil {
-					return err
-				}
-			}
 		}
 	}
 

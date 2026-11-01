@@ -645,17 +645,8 @@ func (r *autoRedirect) nftablesCreateExcludeRules(nft *nftables.Conn, table *nft
 
 	if r.tunOptions.DNSModeOrDefault() == DNSModeHijack && ((chain.Hooknum == nftables.ChainHookPrerouting && chain.Type == nftables.ChainTypeNAT) ||
 		(r.tunOptions.AutoRedirectMarkMode && chain.Hooknum == nftables.ChainHookOutput && chain.Type == nftables.ChainTypeNAT)) {
-		if r.enableIPv4 {
-			err := r.nftablesCreateDNSHijackRulesForFamily(nft, table, chain, nftables.TableFamilyIPv4, 5, "inet4_local_address_set")
-			if err != nil {
-				return err
-			}
-		}
-		if r.enableIPv6 {
-			err := r.nftablesCreateDNSHijackRulesForFamily(nft, table, chain, nftables.TableFamilyIPv6, 6, "inet6_local_address_set")
-			if err != nil {
-				return err
-			}
+		if err := r.nftablesCreateConfiguredDNSHijackRules(nft, table, chain); err != nil {
+			return err
 		}
 	}
 
@@ -951,6 +942,7 @@ func (r *autoRedirect) nftablesCreateLoopbackReroute(
 func (r *autoRedirect) nftablesCreateDNSHijackRulesForFamily(
 	nft *nftables.Conn, table *nftables.Table, chain *nftables.Chain,
 	family nftables.TableFamily, setID uint32, setName string,
+	destination *DNSHijackRule,
 ) error {
 	ipProto := &nftables.Set{
 		Table:     table,
@@ -958,10 +950,13 @@ func (r *autoRedirect) nftablesCreateDNSHijackRulesForFamily(
 		Constant:  true,
 		KeyType:   nftables.TypeInetProto,
 	}
-	err := nft.AddSet(ipProto, []nftables.SetElement{
-		{Key: []byte{unix.IPPROTO_TCP}},
-		{Key: []byte{unix.IPPROTO_UDP}},
-	})
+	protocols := []nftables.SetElement{{Key: []byte{unix.IPPROTO_TCP}}, {Key: []byte{unix.IPPROTO_UDP}}}
+	if destination != nil && destination.Network == "tcp" {
+		protocols = protocols[:1]
+	} else if destination != nil && destination.Network == "udp" {
+		protocols = protocols[1:]
+	}
+	err := nft.AddSet(ipProto, protocols)
 	if err != nil {
 		return err
 	}
@@ -1004,7 +999,7 @@ func (r *autoRedirect) nftablesCreateDNSHijackRulesForFamily(
 				Data:     nftablesIfname("lo"),
 			},
 		)
-	} else {
+	} else if destination == nil || destination.Address.Addr().IsUnspecified() {
 		if family == nftables.TableFamilyIPv4 {
 			exprs = append(exprs,
 				&expr.Payload{
@@ -1032,6 +1027,22 @@ func (r *autoRedirect) nftablesCreateDNSHijackRulesForFamily(
 			SetName:        setName,
 		})
 	}
+	port := uint16(53)
+	if destination != nil {
+		port = destination.Address.Port()
+	}
+	if destination != nil && !destination.Address.Addr().IsUnspecified() {
+		offset := uint32(16)
+		if family == nftables.TableFamilyIPv6 {
+			offset = 24
+		}
+		exprs = append(exprs,
+			&expr.Fib{Register: 1, ResultADDRTYPE: true, FlagDADDR: true},
+			&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL)},
+			&expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: uint32(destination.Address.Addr().BitLen() / 8)},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: destination.Address.Addr().AsSlice()},
+		)
+	}
 	exprs = append(exprs,
 		&expr.Meta{
 			Key:      expr.MetaKeyL4PROTO,
@@ -1052,19 +1063,21 @@ func (r *autoRedirect) nftablesCreateDNSHijackRulesForFamily(
 		&expr.Cmp{
 			Op:       expr.CmpOpEq,
 			Register: 1,
-			Data:     binaryutil.BigEndian.PutUint16(53),
+			Data:     binaryutil.BigEndian.PutUint16(port),
 		},
 		&expr.Counter{},
 		&expr.Immediate{
 			Register: 1,
 			Data:     dnsServer.AsSlice(),
 		},
-		&expr.NAT{
-			Type:       expr.NATTypeDestNAT,
-			Family:     uint32(family),
-			RegAddrMin: 1,
-		},
 	)
+	nat := &expr.NAT{Type: expr.NATTypeDestNAT, Family: uint32(family), RegAddrMin: 1}
+	if destination != nil {
+		exprs = append(exprs, &expr.Immediate{Register: 2, Data: binaryutil.BigEndian.PutUint16(53)})
+		nat.RegProtoMin = 2
+		nat.Specified = true
+	}
+	exprs = append(exprs, nat)
 	nft.AddRule(&nftables.Rule{
 		Table: table,
 		Chain: chain,

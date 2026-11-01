@@ -90,6 +90,7 @@ type Options struct {
 	Inet6Gateway                          netip.Addr
 	DNSMode                               string
 	DNSServers                            []netip.Addr
+	DNSHijack                             []DNSHijackRule
 	IPRoute2TableIndex                    int
 	IPRoute2RuleIndex                     int
 	IPRoute2AutoRedirectFallbackRuleIndex int

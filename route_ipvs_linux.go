@@ -121,6 +121,8 @@ func (t *NativeTun) enableAutoRouteIPVSDNSBypass(path string) {
 }
 
 func (t *NativeTun) refreshIPVSDNSBypass() {
+	t.routeAccess.Lock()
+	defer t.routeAccess.Unlock()
 	newDestinations, err := t.ipvsDNSBypass.Load()
 	if err != nil {
 		if t.options.Logger != nil {

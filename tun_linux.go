@@ -33,6 +33,7 @@ type NativeTun struct {
 	tunFile           *os.File
 	interfaceCallback *list.Element[DefaultInterfaceUpdateCallback]
 	options           Options
+	routeAccess       sync.Mutex
 	dnatBypass        *autoRouteDNATBypass
 	ipvsDNSBypass     *autoRouteIPVSDNSBypass
 	ruleIndex6        []int
@@ -418,7 +419,7 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	if err != nil {
 		return E.Errors(E.Cause(err, "cleanup rules"), t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
-	err = t.setRules()
+	err = setRules(t.rules())
 	if err != nil {
 		_ = t.unsetRules()
 		return E.Errors(err, t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
@@ -470,6 +471,8 @@ func (t *NativeTun) Close() error {
 	if t.interfaceCallback != nil {
 		t.options.InterfaceMonitor.UnregisterCallback(t.interfaceCallback)
 	}
+	t.routeAccess.Lock()
+	defer t.routeAccess.Unlock()
 	if t.options.DNSModeOrDefault() != DNSModeDisabled {
 		t.unsetSearchDomainForSystemdResolved()
 	}
@@ -666,23 +669,18 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		}
 	}
 	if t.ipvsDNSBypass != nil {
-		var added4, added6 bool
 		for _, destination := range t.ipvsDNSBypass.Destinations() {
 			it = t.ipvsDNSRule(destination)
 			if it == nil {
 				continue
 			}
 			rules = append(rules, it)
-			if destination.address.Is4() {
-				added4 = true
-			} else {
-				added6 = true
-			}
 		}
-		if added4 {
+		// Keep later policy priorities stable while IPVS backends change.
+		if p4 {
 			priority++
 		}
-		if added6 {
+		if p6 {
 			priority6++
 		}
 	}
@@ -1021,11 +1019,11 @@ func (t *NativeTun) setRoute(tunLink netlink.Link) error {
 	return nil
 }
 
-func (t *NativeTun) setRules() error {
-	for i, rule := range t.rules() {
+func setRules(rules []*netlink.Rule) error {
+	for i, rule := range rules {
 		err := netlink.RuleAdd(rule)
 		if err != nil {
-			return E.Cause(err, "add rule ", i, "/", len(t.rules()))
+			return E.Cause(err, "add rule ", i, "/", len(rules))
 		}
 	}
 	return nil
@@ -1108,14 +1106,18 @@ func (t *NativeTun) unsetAddresses() {
 }
 
 func (t *NativeTun) resetRules() error {
-	t.unsetRules()
-	return t.setRules()
+	if err := t.unsetRules(); err != nil {
+		return err
+	}
+	return setRules(t.rules())
 }
 
 func (t *NativeTun) routeUpdate(_ *control.Interface, flags int) {
 	if flags&FlagAndroidVPNUpdate == 0 {
 		return
 	}
+	t.routeAccess.Lock()
+	defer t.routeAccess.Unlock()
 	err := t.resetRules()
 	if err != nil {
 		if t.options.Logger != nil {

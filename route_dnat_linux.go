@@ -258,15 +258,16 @@ func (b *autoRouteDNATBypass) setupNFTables() error {
 }
 
 func (b *autoRouteDNATBypass) cleanupNFTables() error {
+	return deleteRouteNFTTable(nftables.TableFamilyINet, b.tableName)
+}
+
+func deleteRouteNFTTable(family nftables.TableFamily, name string) error {
 	nft, err := nftables.New()
 	if err != nil {
 		return err
 	}
 	defer nft.CloseLasting()
-	nft.DelTable(&nftables.Table{
-		Name:   b.tableName,
-		Family: nftables.TableFamilyINet,
-	})
+	nft.DelTable(&nftables.Table{Name: name, Family: family})
 	err = nft.Flush()
 	if errors.Is(err, syscall.ENOENT) {
 		return nil
@@ -317,24 +318,24 @@ func (b *autoRouteDNATBypass) setupIPTables() error {
 		if path == "" {
 			continue
 		}
-		if err := b.runIPTables(path, "-t", "mangle", "-N", b.chainName); err != nil {
+		if err := runIPTables(path, "-t", "mangle", "-N", b.chainName); err != nil {
 			return err
 		}
-		if err := b.runIPTables(
+		if err := runIPTables(
 			path, "-t", "mangle", "-A", b.chainName,
 			"-m", "addrtype", "--dst-type", "LOCAL",
 			"-j", "MARK", "--set-xmark", fmt.Sprintf("%#x/%#x", b.options.autoRouteDNATBypassMark(), markMask),
 		); err != nil {
 			return err
 		}
-		if err := b.runIPTables(
+		if err := runIPTables(
 			path, "-t", "mangle", "-A", b.chainName,
 			"-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "REPLY",
 			"-j", "MARK", "--set-xmark", fmt.Sprintf("%#x/%#x", b.options.autoRouteDNATBypassMark(), markMask),
 		); err != nil {
 			return err
 		}
-		if err := b.runIPTables(path, "-t", "mangle", "-I", "PREROUTING", "-j", b.chainName); err != nil {
+		if err := runIPTables(path, "-t", "mangle", "-I", "PREROUTING", "-j", b.chainName); err != nil {
 			return err
 		}
 	}
@@ -345,24 +346,24 @@ func (b *autoRouteDNATBypass) cleanupIPTables() error {
 	var errs []error
 	for _, path := range []string{b.iptablesPath, b.ip6tablesPath} {
 		if path != "" {
-			errs = append(errs, b.cleanupIPTablesFamily(path))
+			errs = append(errs, cleanupIPTablesChain(path, "mangle", "PREROUTING", b.chainName))
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func (b *autoRouteDNATBypass) cleanupIPTablesFamily(path string) error {
-	list, err := b.outputIPTables(path, "-t", "mangle", "-S")
+func cleanupIPTablesChain(path, table, hook, chain string) error {
+	list, err := outputIPTables(path, "-t", table, "-S")
 	if err != nil {
 		return err
 	}
 	chainExists := false
 	for _, line := range strings.Split(string(list), "\n") {
 		switch line {
-		case "-N " + b.chainName:
+		case "-N " + chain:
 			chainExists = true
-		case "-A PREROUTING -j " + b.chainName:
-			if err := b.runIPTables(path, "-t", "mangle", "-D", "PREROUTING", "-j", b.chainName); err != nil {
+		case "-A " + hook + " -j " + chain:
+			if err := runIPTables(path, "-t", table, "-D", hook, "-j", chain); err != nil {
 				return err
 			}
 		}
@@ -370,13 +371,13 @@ func (b *autoRouteDNATBypass) cleanupIPTablesFamily(path string) error {
 	if !chainExists {
 		return nil
 	}
-	if err := b.runIPTables(path, "-t", "mangle", "-F", b.chainName); err != nil {
+	if err := runIPTables(path, "-t", table, "-F", chain); err != nil {
 		return err
 	}
-	return b.runIPTables(path, "-t", "mangle", "-X", b.chainName)
+	return runIPTables(path, "-t", table, "-X", chain)
 }
 
-func (b *autoRouteDNATBypass) outputIPTables(path string, args ...string) ([]byte, error) {
+func outputIPTables(path string, args ...string) ([]byte, error) {
 	output, err := exec.Command(path, append([]string{"-w", "5"}, args...)...).CombinedOutput()
 	if err != nil {
 		return nil, E.Extend(err, fmt.Sprintf("%s %v: %s", path, args, output))
@@ -384,8 +385,8 @@ func (b *autoRouteDNATBypass) outputIPTables(path string, args ...string) ([]byt
 	return output, nil
 }
 
-func (b *autoRouteDNATBypass) runIPTables(path string, args ...string) error {
-	_, err := b.outputIPTables(path, args...)
+func runIPTables(path string, args ...string) error {
+	_, err := outputIPTables(path, args...)
 	return err
 }
 
