@@ -16,6 +16,34 @@ import (
 // https://github.com/zerotier/ZeroTierOne/blob/1.8.6/osdep/WindowsEthernetTap.cpp#L994
 var zeroTierFakeGatewayIp = netip.MustParseAddr("25.255.255.254")
 
+type defaultRouteCandidate struct {
+	index  int
+	alias  string
+	metric uint32
+}
+
+func selectDefaultRouteCandidate(candidates []defaultRouteCandidate, previousIndex int) (defaultRouteCandidate, bool) {
+	if len(candidates) == 0 {
+		return defaultRouteCandidate{}, false
+	}
+
+	best := candidates[0]
+	bestIsPrevious := best.index == previousIndex
+
+	for _, candidate := range candidates[1:] {
+		switch {
+		case candidate.metric < best.metric:
+			best = candidate
+			bestIsPrevious = candidate.index == previousIndex
+		case candidate.metric == best.metric && !bestIsPrevious && candidate.index == previousIndex:
+			best = candidate
+			bestIsPrevious = true
+		}
+	}
+
+	return best, true
+}
+
 type networkUpdateMonitor struct {
 	routeListener     *winipcfg.RouteChangeCallback
 	interfaceListener *winipcfg.InterfaceChangeCallback
@@ -69,9 +97,12 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 		return err
 	}
 
-	lowestMetric := ^uint32(0)
-	alias := ""
-	var index int
+	previousIndex := 0
+	if oldInterface := m.defaultInterface.Load(); oldInterface != nil {
+		previousIndex = oldInterface.Index
+	}
+
+	candidatesByIndex := map[int]defaultRouteCandidate{}
 
 	for _, row := range rows {
 		if row.DestinationPrefix.PrefixLength != 0 {
@@ -101,20 +132,30 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 		}
 
 		metric := row.Metric + iface.Metric
-		if metric < lowestMetric {
-			lowestMetric = metric
-			alias = ifrow.Alias()
-			index = int(ifrow.InterfaceIndex)
+
+		candidate := defaultRouteCandidate{
+			index:  int(ifrow.InterfaceIndex),
+			alias:  ifrow.Alias(),
+			metric: metric,
+		}
+		if existing, ok := candidatesByIndex[candidate.index]; !ok || candidate.metric < existing.metric {
+			candidatesByIndex[candidate.index] = candidate
 		}
 	}
 
-	if alias == "" {
+	candidates := make([]defaultRouteCandidate, 0, len(candidatesByIndex))
+	for _, candidate := range candidatesByIndex {
+		candidates = append(candidates, candidate)
+	}
+
+	selected, ok := selectDefaultRouteCandidate(candidates, previousIndex)
+	if !ok {
 		return ErrNoRoute
 	}
 
-	newInterface, err := m.interfaceFinder.ByIndex(index)
+	newInterface, err := m.interfaceFinder.ByIndex(selected.index)
 	if err != nil {
-		return E.Cause(err, "find updated interface: ", alias)
+		return E.Cause(err, "find updated interface: ", selected.alias)
 	}
 	oldInterface := m.defaultInterface.Swap(newInterface)
 	if oldInterface != nil && oldInterface.Equals(*newInterface) {
