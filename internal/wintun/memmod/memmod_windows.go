@@ -396,8 +396,6 @@ type addressRange struct {
 }
 
 var (
-	loadedAddressRanges         []addressRange
-	loadedAddressRangesMu       sync.RWMutex
 	haveHookedRtlPcToFileHeader sync.Once
 	hookRtlPcToFileHeaderResult error
 )
@@ -443,18 +441,10 @@ func hookRtlPcToFileHeader() error {
 		return err
 	}
 	originalRtlPcToFileHeader := *thunk
-	*thunk = windows.NewCallback(func(pcValue uintptr, baseOfImage *uintptr) uintptr {
-		loadedAddressRangesMu.RLock()
-		for i := range loadedAddressRanges {
-			if pcValue >= loadedAddressRanges[i].start && pcValue < loadedAddressRanges[i].end {
-				pcValue = *thunk
-				break
-			}
-		}
-		loadedAddressRangesMu.RUnlock()
-		ret, _, _ := syscall.SyscallN(originalRtlPcToFileHeader, pcValue, uintptr(unsafe.Pointer(baseOfImage)))
-		return ret
-	})
+	// GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) is called by system DLLs from DllMain, that is,
+	// with the loader lock held. The replacement therefore must not be Go code where the architecture allows it:
+	// see newRtlPcToFileHeaderHook.
+	*thunk = newRtlPcToFileHeaderHook(originalRtlPcToFileHeader, thunk)
 	err = windows.VirtualProtect(uintptr(unsafe.Pointer(thunk)), unsafe.Sizeof(*thunk), oldProtect, &oldProtect)
 	if err != nil {
 		return err
@@ -612,9 +602,10 @@ func LoadLibrary(data []byte) (module *Module, err error) {
 	module.registerExceptionHandlers()
 
 	// Register function PCs.
-	loadedAddressRangesMu.Lock()
-	loadedAddressRanges = append(loadedAddressRanges, addressRange{module.codeBase, module.codeBase + alignedImageSize})
-	loadedAddressRangesMu.Unlock()
+	err = registerAddressRange(addressRange{module.codeBase, module.codeBase + alignedImageSize})
+	if err != nil {
+		return
+	}
 	haveHookedRtlPcToFileHeader.Do(func() {
 		hookRtlPcToFileHeaderResult = hookRtlPcToFileHeader()
 	})
