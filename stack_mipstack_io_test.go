@@ -367,8 +367,13 @@ func TestMipsWindowsReadFailureExitsReadLoop(t *testing.T) {
 		windowsTun:  &windowsTun{memoryTun: newMemoryTun()},
 		readFailure: errors.New("send ring corrupt"),
 	}
-	t.Cleanup(func() { _ = d.Close() })
-	s := &Mipstack{tun: d, logger: logger.NOP()}
+	s := &Mipstack{tun: d, logger: logger.NOP(), mtu: 1500}
+	stack, err := mipstack.New(s.config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close(); _ = d.Close() })
+	s.stack = stack
 	done := make(chan struct{})
 	go func() { s.readLoop(); close(done) }()
 	select {

@@ -221,6 +221,36 @@ func (t *NativeTun) BatchRead(buffers [][]byte, offset int, readN []int) (n int,
 }
 
 func (t *NativeTun) BatchWrite(buffers [][]byte, offset int) (int, error) {
+	if len(buffers) == 1 {
+		if t.vnetHdr {
+			if offset < virtioNetHdrLen || offset > len(buffers[0])-1 {
+				return 0, errors.New("invalid offset")
+			}
+			hdr := virtioNetHdr{}
+			if err := hdr.encode(buffers[0][offset-virtioNetHdrLen:]); err != nil {
+				return 0, err
+			}
+			offset -= virtioNetHdrLen
+		}
+		// A single packet needs no shared GRO state. Keep writes serialized
+		// with complete batches, including callers using Write concurrently.
+		packet := buffers[0][offset:]
+		t.writeAccess.Lock()
+		n, err := t.tunFile.Write(packet)
+		t.writeAccess.Unlock()
+		if errors.Is(err, syscall.EBADFD) {
+			return 0, os.ErrClosed
+		}
+		if err != nil {
+			return 0, errors.Join(err)
+		}
+		return n, nil
+	}
+	return t.batchWrite(buffers, offset)
+}
+
+// batchWrite keeps GRO state and cleanup off the single-packet path.
+func (t *NativeTun) batchWrite(buffers [][]byte, offset int) (int, error) {
 	t.writeAccess.Lock()
 	defer func() {
 		t.tcpGROTable.reset()
