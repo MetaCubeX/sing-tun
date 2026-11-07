@@ -922,6 +922,19 @@ func udpGRO(bufs [][]byte, offset int, pktI int, table *udpGROTable, isV6, skipC
 // are supported/enabled. skipChecksumValidation requires complete, valid
 // transport checksums; IPv4 UDP may use a zero checksum to disable checksumming.
 func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGROTable, gro groDisablementFlags, skipChecksumValidation bool, toWrite *[]int) error {
+	if len(bufs) == 1 {
+		if offset < virtioNetHdrLen || offset > len(bufs[0])-1 {
+			return errors.New("invalid offset")
+		}
+		// A single packet cannot coalesce. Keep the same zero virtio header
+		// without classifying it or walking the empty per-batch flow tables.
+		hdr := virtioNetHdr{}
+		if err := hdr.encode(bufs[0][offset-virtioNetHdrLen:]); err != nil {
+			return err
+		}
+		*toWrite = append(*toWrite, 0)
+		return nil
+	}
 	for i := range bufs {
 		if offset < virtioNetHdrLen || offset > len(bufs[i])-1 {
 			return errors.New("invalid offset")
