@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
 	E "github.com/metacubex/sing/common/exceptions"
+	"github.com/metacubex/sing/common/logger"
 	"github.com/metacubex/sing/common/shell"
 
 	"golang.org/x/net/route"
@@ -183,7 +184,7 @@ func init() {
 }
 
 func (t *NativeTun) Close() error {
-	defer flushDNSCache()
+	defer flushDNSCache(t.options.Logger)
 	dnsErr := common.Close(t.dnsRegistration)
 	t.stopFd.Stop()
 	err := t.tunFile.Close()
@@ -344,7 +345,7 @@ func create(tunFd int, ifIndex int, name string, options Options) error {
 				return E.Cause(err, "add route: ", routeRange)
 			}
 		}
-		flushDNSCache()
+		flushDNSCache(options.Logger)
 	}
 	return nil
 }
@@ -501,7 +502,7 @@ func (t *NativeTun) configureDNS() error {
 		return err
 	}
 	t.dnsRegistration = registration
-	flushDNSCache()
+	flushDNSCache(t.options.Logger)
 	return nil
 }
 
@@ -543,6 +544,18 @@ func addRoute(destination netip.Prefix, gateway netip.Addr) error {
 	})
 }
 
-func flushDNSCache() {
-	shell.Exec("dscacheutil", "-flushcache").Start()
+func flushDNSCache(log logger.Logger) {
+	cmd := shell.Exec("dscacheutil", "-flushcache")
+	if err := cmd.Start(); err != nil {
+		if log != nil {
+			log.Warn(E.Cause(err, "flush DNS cache"))
+		}
+		return
+	}
+	// Preserve asynchronous flushing, but reap every successfully started child.
+	go func() {
+		if err := cmd.Wait(); err != nil && log != nil {
+			log.Warn(E.Cause(err, "flush DNS cache"))
+		}
+	}()
 }
