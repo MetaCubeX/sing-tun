@@ -1064,9 +1064,17 @@ func (t *NativeTun) setSearchDomainForSystemdResolved() error {
 		return err
 	}
 	go func() {
-		_ = shell.Exec(ctlPath, "domain", t.options.Name, "~.").Run()
-		_ = shell.Exec(ctlPath, "default-route", t.options.Name, "true").Run()
-		_ = shell.Exec(ctlPath, append([]string{"dns", t.options.Name}, common.Map(dnsServer, netip.Addr.String)...)...).Run()
+		commands := [][]string{
+			{"domain", t.options.Name, "~."},
+			{"default-route", t.options.Name, "true"},
+			append([]string{"dns", t.options.Name}, common.Map(dnsServer, netip.Addr.String)...),
+		}
+		for _, args := range commands {
+			output, err := shell.Exec(ctlPath, args...).Read()
+			if err != nil && t.options.Logger != nil {
+				t.options.Logger.Error(E.Extend(E.Cause(err, "set DNS configuration for interface: ", t.options.Name), output))
+			}
+		}
 	}()
 	return nil
 }
