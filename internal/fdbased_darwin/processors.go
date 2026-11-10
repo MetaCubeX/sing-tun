@@ -25,7 +25,6 @@ import (
 	"github.com/metacubex/gvisor/pkg/tcpip/hash/jenkins"
 	"github.com/metacubex/gvisor/pkg/tcpip/header"
 	"github.com/metacubex/gvisor/pkg/tcpip/stack"
-	"github.com/metacubex/gvisor/pkg/tcpip/stack/gro"
 )
 
 // +stateify savable
@@ -33,9 +32,10 @@ type processor struct {
 	mu processorMutex `state:"nosave"`
 	// +checklocks:mu
 	pkts stack.PacketBufferList
+	// batch is owned by the delivery goroutine.
+	batch stack.PacketBufferList
 
 	e           *endpoint
-	gro         gro.GRO
 	sleeper     sleep.Sleeper
 	packetWaker sleep.Waker
 	closeWaker  sleep.Waker
@@ -59,9 +59,9 @@ func (p *processor) start(wg *sync.WaitGroup) {
 
 func (p *processor) deliverPackets() {
 	p.e.mu.RLock()
-	p.gro.Dispatcher = p.e.dispatcher
+	dispatcher := p.e.dispatcher
 	p.e.mu.RUnlock()
-	if p.gro.Dispatcher == nil {
+	if dispatcher == nil {
 		p.mu.Lock()
 		p.pkts.Reset()
 		p.mu.Unlock()
@@ -70,14 +70,15 @@ func (p *processor) deliverPackets() {
 
 	p.mu.Lock()
 	for p.pkts.Len() > 0 {
-		pkt := p.pkts.PopFront()
+		p.pkts, p.batch = p.batch, p.pkts
 		p.mu.Unlock()
-		p.gro.Enqueue(pkt)
-		pkt.DecRef()
+		for _, pkt := range p.batch.AsSlice() {
+			dispatcher.DeliverNetworkPacket(pkt.NetworkProtocolNumber, pkt)
+		}
+		p.batch.Reset()
 		p.mu.Lock()
 	}
 	p.mu.Unlock()
-	p.gro.Flush()
 }
 
 // processorManager handles starting, closing, and queuing packets on processor
@@ -105,7 +106,6 @@ func newProcessorManager(opts *Options, e *endpoint) *processorManager {
 		p := &m.processors[i]
 		p.sleeper.AddWaker(&p.packetWaker)
 		p.sleeper.AddWaker(&p.closeWaker)
-		p.gro.Init(false)
 		p.e = e
 	}
 
