@@ -44,6 +44,7 @@ type System struct {
 	tcpListener6         net.Listener
 	tcpPort              uint16
 	tcpPort6             uint16
+	natCancel            context.CancelFunc
 	tcpNat4              *TCPNat
 	tcpNat6              *TCPNat
 	directNat            *DirectRouteMapping
@@ -103,6 +104,15 @@ func NewSystem(options StackOptions) (Stack, error) {
 }
 
 func (s *System) Close() error {
+	if s.natCancel != nil {
+		s.natCancel()
+		if s.tcpNat4 != nil {
+			<-s.tcpNat4.done
+		}
+		if s.tcpNat6 != nil {
+			<-s.tcpNat6.done
+		}
+	}
 	return common.Close(
 		s.tcpListener,
 		s.tcpListener6,
@@ -118,7 +128,14 @@ func (s *System) Start() error {
 	return nil
 }
 
-func (s *System) start() error {
+func (s *System) start() (err error) {
+	natCtx, cancel := context.WithCancel(s.ctx)
+	s.natCancel = cancel
+	defer func() {
+		if err != nil {
+			_ = s.Close()
+		}
+	}()
 	_ = fixWindowsFirewall()
 	var listener net.ListenConfig
 	if s.bindInterface || s.enforceBind {
@@ -134,7 +151,6 @@ func (s *System) start() error {
 		})
 	}
 	var tcpListener net.Listener
-	var err error
 	if s.inet4NextAddress.IsValid() {
 		address := net.JoinHostPort(s.inet4Address.String(), "0")
 		if s.enforceBind {
@@ -152,7 +168,7 @@ func (s *System) start() error {
 		}
 		s.tcpListener = tcpListener
 		s.tcpPort = M.SocksaddrFromNet(tcpListener.Addr()).Port
-		s.tcpNat4 = NewNat(s.ctx, s.udpTimeout)
+		s.tcpNat4 = NewNat(natCtx, s.udpTimeout)
 		go s.acceptLoop(tcpListener, s.tcpNat4)
 	}
 	if s.inet6NextAddress.IsValid() {
@@ -172,7 +188,7 @@ func (s *System) start() error {
 		}
 		s.tcpListener6 = tcpListener
 		s.tcpPort6 = M.SocksaddrFromNet(tcpListener.Addr()).Port
-		s.tcpNat6 = NewNat(s.ctx, s.udpTimeout)
+		s.tcpNat6 = NewNat(natCtx, s.udpTimeout)
 		go s.acceptLoop(tcpListener, s.tcpNat6)
 	}
 	s.directNat = NewDirectRouteMapping(s.icmpTimeout)

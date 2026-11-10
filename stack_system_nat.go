@@ -10,6 +10,7 @@ import (
 )
 
 type TCPNat struct {
+	done       chan struct{}
 	timeout    time.Duration
 	portIndex  uint16
 	portAccess sync.RWMutex
@@ -33,6 +34,7 @@ type TCPSession struct {
 func NewNat(ctx context.Context, timeout time.Duration) *TCPNat {
 	natMap := &TCPNat{
 		timeout:   timeout,
+		done:      make(chan struct{}),
 		portIndex: 10000,
 		addrMap:   make(map[tcpNatKey]uint16),
 		portMap:   make(map[uint16]*TCPSession),
@@ -42,6 +44,7 @@ func NewNat(ctx context.Context, timeout time.Duration) *TCPNat {
 }
 
 func (n *TCPNat) loopCheckTimeout(ctx context.Context) {
+	defer close(n.done)
 	ticker := time.NewTicker(n.timeout)
 	defer ticker.Stop()
 	for {
