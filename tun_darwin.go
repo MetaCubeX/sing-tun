@@ -38,7 +38,7 @@ type NativeTun struct {
 	msgHdrs         []rawfile.MsgHdrX
 	msgHdrsOutput   []rawfile.MsgHdrX
 	buffers         []*buf.Buffer
-	stopFd          stopfd.StopFD
+	stopFd          *stopfd.StopFD
 	options         Options
 	inet4Address    [4]byte
 	inet6Address    [16]byte
