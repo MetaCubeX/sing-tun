@@ -41,6 +41,7 @@ func (m *Mixed) Start() error {
 	endpoint := channel.New(1024, uint32(m.mtu), "")
 	ipStack, err := NewGVisorStack(endpoint)
 	if err != nil {
+		_ = m.System.Close()
 		return err
 	}
 	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, NewUDPForwarder(m.ctx, ipStack, m.handler).HandlePacket)
@@ -276,7 +277,7 @@ func (m *Mixed) packetLoop() {
 
 func (m *Mixed) Close() error {
 	if m.stack == nil {
-		return nil
+		return m.System.Close()
 	}
 	m.endpoint.Attach(nil)
 	m.stack.Close()
