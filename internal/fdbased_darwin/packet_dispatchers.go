@@ -18,7 +18,6 @@ import (
 	"github.com/metacubex/gvisor/pkg/buffer"
 	"github.com/metacubex/gvisor/pkg/tcpip"
 	"github.com/metacubex/gvisor/pkg/tcpip/stack"
-	"github.com/metacubex/gvisor/pkg/tcpip/stack/gro"
 	"github.com/metacubex/sing-tun/internal/rawfile_darwin"
 	"github.com/metacubex/sing-tun/internal/stopfd_darwin"
 
@@ -26,22 +25,29 @@ import (
 )
 
 type iovecBuffer struct {
-	mtu    int
-	views  []*buffer.View
-	iovecs []unix.Iovec `state:"nosave"`
+	mtu         int
+	header      [4]byte
+	fixedHeader bool
+	views       []*buffer.View
+	iovecs      []unix.Iovec `state:"nosave"`
 }
 
-func newIovecBuffer(mtu uint32) *iovecBuffer {
+func newIovecBuffer(mtu uint32, fixedHeader bool) *iovecBuffer {
 	b := &iovecBuffer{
-		mtu:    int(mtu),
-		views:  make([]*buffer.View, 2),
-		iovecs: make([]unix.Iovec, 2),
+		mtu:         int(mtu),
+		fixedHeader: fixedHeader,
+		views:       make([]*buffer.View, 2),
+		iovecs:      make([]unix.Iovec, 2),
+	}
+	if fixedHeader {
+		b.iovecs[0] = unix.Iovec{Base: &b.header[0]}
+		b.iovecs[0].SetLen(len(b.header))
 	}
 	return b
 }
 
 func (b *iovecBuffer) nextIovecs() []unix.Iovec {
-	if b.views[0] == nil {
+	if !b.fixedHeader && b.views[0] == nil {
 		b.views[0] = buffer.NewViewSize(4)
 		b.iovecs[0] = unix.Iovec{Base: b.views[0].BasePtr()}
 		b.iovecs[0].SetLen(4)
@@ -54,12 +60,16 @@ func (b *iovecBuffer) nextIovecs() []unix.Iovec {
 	return b.iovecs
 }
 
-// pullBuffer extracts the enough underlying storage from b.buffer to hold n
-// bytes. It removes this storage from b.buffer, returns a new buffer
-// that holds the storage, and updates pulledIndex to indicate which part
-// of b.buffer's storage must be reallocated during the next call to
-// nextIovecs.
 func (b *iovecBuffer) pullBuffer(n int) buffer.Buffer {
+	if b.fixedHeader {
+		pulled := buffer.MakeWithView(b.views[1])
+		b.views[1] = nil
+		if n < len(b.header) {
+			n = len(b.header)
+		}
+		pulled.Truncate(int64(n - len(b.header)))
+		return pulled
+	}
 	pulled := buffer.Buffer{}
 	pulled.Append(b.views[0])
 	pulled.Append(b.views[1])
@@ -108,7 +118,7 @@ func newReadVDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, err
 		fd:     fd,
 		e:      e,
 	}
-	d.buf = newIovecBuffer(opts.MTU)
+	d.buf = newIovecBuffer(opts.MTU, true)
 	d.mgr = newProcessorManager(opts, e)
 	d.mgr.start()
 	return d, nil
@@ -167,9 +177,6 @@ type recvMMsgDispatcher struct {
 	// pkts is reused to avoid allocations.
 	pkts stack.PacketBufferList
 
-	// gro coalesces incoming packets to increase throughput.
-	gro gro.GRO
-
 	// mgr is the processor goroutine manager.
 	mgr *processorManager
 }
@@ -187,9 +194,8 @@ func newRecvMMsgDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, 
 		msgHdrs: make([]rawfile.MsgHdrX, e.batchSize),
 	}
 	for i := range d.bufs {
-		d.bufs[i] = newIovecBuffer(opts.MTU)
+		d.bufs[i] = newIovecBuffer(opts.MTU, false)
 	}
-	d.gro.Init(false)
 	d.mgr = newProcessorManager(opts, e)
 	d.mgr.start()
 
@@ -229,10 +235,8 @@ func (d *recvMMsgDispatcher) dispatch() (bool, tcpip.Error) {
 
 	d.e.mu.RLock()
 	addr := d.e.addr
-	dsp := d.e.dispatcher
 	d.e.mu.RUnlock()
 
-	d.gro.Dispatcher = dsp
 	defer d.pkts.Reset()
 
 	for k := 0; k < nMsgs; k++ {
