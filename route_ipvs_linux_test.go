@@ -101,6 +101,29 @@ func TestAutoRouteIPVSDNSBypassMissingTable(t *testing.T) {
 	require.Equal(t, []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.70:53")}}, destinations)
 }
 
+func TestServiceDNSRoutesSurviveInitialIPVSReadFailure(t *testing.T) {
+	runCalicoIntegration(t, func() {
+		runTestIP(t, "link", "add", "cilium_host", "type", "veth", "peer", "name", "cilium_net")
+		runTestIP(t, "link", "set", "cilium_host", "up")
+		runTestIP(t, "link", "set", "cilium_net", "up")
+		runTestIP(t, "addr", "add", "192.0.2.1/24", "dev", "cilium_host")
+		runTestIP(t, "route", "add", "10.85.1.0/24", "via", "192.0.2.2", "dev", "cilium_host")
+		path := filepath.Join(t.TempDir(), "ip_vs")
+		require.NoError(t, os.Mkdir(path, 0o700))
+		n := newIPVSDNSRuleTestTun()
+		t.Cleanup(func() { require.NoError(t, n.unsetRules()) })
+		n.enableAutoRouteIPVSDNSBypass(path)
+		if n.ipvsDNSBypass != nil {
+			n.refreshIPVSDNSBypass()
+		}
+		require.Contains(t, runTestIP(t, "-4", "rule", "show"), "to 10.85.1.0/24", "Cilium DNS lookup must be installed while IPVS cannot be read")
+		require.NoError(t, os.Remove(path))
+		require.NoError(t, os.WriteFile(path, []byte("UDP  0A0A000A:0035 rr\n  -> 0A7ADB46:0035 Masq 1 0 0\n"), 0o600))
+		n.refreshIPVSDNSBypass()
+		require.Contains(t, runTestIP(t, "-4", "rule", "show"), "to 10.122.219.70", "a subsequent refresh must install the IPVS backend")
+	})
+}
+
 func TestUpdateIPVSDNSRulesUsesExactDifference(t *testing.T) {
 	nativeTun := newIPVSDNSRuleTestTun()
 	oldDestinations := []ipvsDNSDestination{{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("10.122.219.70:53")}}

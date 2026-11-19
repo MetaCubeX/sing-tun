@@ -13,10 +13,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	E "github.com/metacubex/sing/common/exceptions"
 	"github.com/sagernet/netlink"
+	"github.com/sagernet/netlink/nl"
 	"golang.org/x/exp/slices"
 	"golang.org/x/sys/unix"
 )
@@ -49,27 +51,89 @@ func newAutoRouteIPVSDNSBypass(path string) (*autoRouteIPVSDNSBypass, error) {
 		done: make(chan struct{}),
 	}
 	destinations, err := bypass.Load()
-	if err != nil {
-		return nil, err
+	if err == nil {
+		bypass.destinations = destinations
 	}
-	bypass.destinations = destinations
-	return bypass, nil
+	return bypass, err
 }
 
-func (b *autoRouteIPVSDNSBypass) Start(update func()) {
-	b.access.Lock()
-	if b.started {
-		b.access.Unlock()
-		return
+func subscribeAutoRouteNetlink(protocol int, groups ...uint) (*nl.NetlinkSocket, error) {
+	// The pinned Subscribe implementation does not set SOCK_CLOEXEC.
+	// Prevent an iptables child from keeping a closed queue or watcher alive.
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	socket, err := nl.Subscribe(protocol, groups...)
+	if err == nil {
+		unix.CloseOnExec(socket.GetFd())
 	}
+	return socket, err
+}
+
+func (b *autoRouteIPVSDNSBypass) Start(update func()) error {
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.started {
+		return nil
+	}
+	routes, err := subscribeAutoRouteNetlink(unix.NETLINK_ROUTE, unix.RTNLGRP_IPV4_ROUTE, unix.RTNLGRP_IPV6_ROUTE)
+	if err != nil {
+		return err
+	}
+	events := make(chan struct{}, 1)
+	var listeners sync.WaitGroup
+	listeners.Add(1)
+	go func() {
+		defer listeners.Done()
+		notify := func() {
+			select {
+			case events <- struct{}{}:
+			default:
+			}
+		}
+		for {
+			messages, from, err := routes.Receive()
+			if errors.Is(err, unix.ENOBUFS) {
+				// Rebuild from a complete snapshot after lost route events.
+				notify()
+				continue
+			}
+			if err != nil {
+				return
+			}
+			if from.Pid != nl.PidKernel {
+				continue
+			}
+			var routeChanged, topologyChanged bool
+			for _, message := range messages {
+				switch message.Header.Type {
+				case unix.RTM_NEWLINK, unix.RTM_DELLINK, unix.RTM_NEWADDR, unix.RTM_DELADDR:
+					topologyChanged = true
+				case unix.RTM_NEWROUTE, unix.RTM_DELROUTE:
+					routeChanged = true
+				}
+			}
+			if topologyChanged {
+			}
+			if topologyChanged || routeChanged {
+				notify()
+			}
+		}
+	}()
 	b.started = true
-	b.access.Unlock()
 	go func() {
 		defer close(b.done)
+		defer func() { routes.Close(); listeners.Wait() }()
 		ticker := time.NewTicker(ipvsDNSRefreshInterval)
 		defer ticker.Stop()
 		for {
 			select {
+			case <-b.stop:
+				return
+			default:
+			}
+			select {
+			case <-events:
+				update()
 			case <-ticker.C:
 				update()
 			case <-b.stop:
@@ -77,6 +141,7 @@ func (b *autoRouteIPVSDNSBypass) Start(update func()) {
 			}
 		}
 	}()
+	return nil
 }
 
 func (b *autoRouteIPVSDNSBypass) Close() {
@@ -112,13 +177,10 @@ func (b *autoRouteIPVSDNSBypass) Replace(destinations []ipvsDNSDestination) {
 
 func (t *NativeTun) enableAutoRouteIPVSDNSBypass(path string) {
 	bypass, err := newAutoRouteIPVSDNSBypass(path)
-	if err != nil {
-		if t.options.Logger != nil {
-			t.options.Logger.Warn(E.Cause(err, "auto-route IPVS DNS bypass unavailable; continuing without IPVS DNS protection"))
-		}
-		return
-	}
 	t.ipvsDNSBypass = bypass
+	if err != nil && t.options.Logger != nil {
+		t.options.Logger.Warn(E.Cause(err, "read initial IPVS DNS backends; retrying on refresh"))
+	}
 }
 
 func (t *NativeTun) refreshIPVSDNSBypass() {
@@ -136,6 +198,9 @@ func (t *NativeTun) refreshIPVSDNSBypass() {
 			}
 		}
 		return
+	}
+	if err := t.refreshServiceRoutes(); err != nil && t.options.Logger != nil {
+		t.options.Logger.Warn(E.Cause(err, "refresh eBPF service routes"))
 	}
 	newDestinations, err := t.ipvsDNSBypass.Load()
 	if err != nil {

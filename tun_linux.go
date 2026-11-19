@@ -37,6 +37,7 @@ type NativeTun struct {
 	dnatBypass        *autoRouteDNATBypass
 	ipvsDNSBypass     *autoRouteIPVSDNSBypass
 	ipvsDNSPending    map[ipvsDNSDestination]bool
+	serviceRoutes     map[serviceRoute]bool
 	ruleIndex6        []int
 	readAccess        sync.Mutex
 	writeAccess       sync.Mutex
@@ -438,7 +439,11 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	}
 	if t.ipvsDNSBypass != nil {
 		t.refreshIPVSDNSBypass()
-		t.ipvsDNSBypass.Start(t.refreshIPVSDNSBypass)
+		if err = t.ipvsDNSBypass.Start(t.refreshIPVSDNSBypass); err != nil {
+			return E.Errors(err, t.rollbackAutoRoute(tunLink))
+		}
+		// Cover changes between the initial snapshot and event subscription.
+		t.refreshIPVSDNSBypass()
 	}
 
 	if t.options.AutoRoute && runtime.GOOS == "android" {
