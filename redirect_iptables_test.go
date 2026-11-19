@@ -6,10 +6,52 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/metacubex/sing/common/ranges"
 	"github.com/stretchr/testify/require"
 )
+
+func TestConfiguredDNSDoesNotExpandUIDsInPrerouting(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "args")
+	path := filepath.Join(dir, "iptables")
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\necho \"$*\" >> \"$ARG_LOG\"\n"), 0700))
+	t.Setenv("ARG_LOG", log)
+	r := &autoRedirect{iptablesPath: path, tableName: "test", customRedirectPort: 1234, tunOptions: &Options{Name: "tun0", AutoRoute: true, Inet4Address: []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")}, IncludeUID: []ranges.Range[uint32]{{Start: 10, End: 12}}, DNSHijack: []DNSHijackRule{{Network: "udp", Address: netip.MustParseAddrPort("0.0.0.0:53")}}}}
+	require.NoError(t, r.setupIPTablesForFamily(path))
+	cmds, err := os.ReadFile(log)
+	require.NoError(t, err)
+	for _, line := range strings.Split(string(cmds), "\n") {
+		if strings.Contains(line, "test-prerouting ") {
+			require.NotContains(t, line, "--uid-owner")
+		}
+	}
+}
+
+func TestIPTablesMaxIncludeUID(t *testing.T) {
+	if os.Getenv("SING_TUN_INTEGRATION") != "1" {
+		t.Skip("requires CAP_NET_ADMIN in an isolated network namespace")
+	}
+	path, err := exec.LookPath("iptables")
+	require.NoError(t, err)
+	r := &autoRedirect{
+		iptablesPath: path, enableIPv4: true, tableName: "uid-test", customRedirectPort: 1234,
+		tunOptions: &Options{
+			Name: "tun0", AutoRoute: true,
+			Inet4Address: []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
+			IncludeUID:   []ranges.Range[uint32]{{Start: 0xfffffffe, End: 0xffffffff}},
+			DNSHijack:    []DNSHijackRule{{Network: "udp", Address: netip.MustParseAddrPort("0.0.0.0:53")}},
+		},
+	}
+	t.Cleanup(r.cleanupIPTables)
+	require.NoError(t, r.setupIPTablesForFamily(path))
+	output, err := exec.Command(path, "-t", "nat", "-S", "uid-test-output").CombinedOutput()
+	require.NoError(t, err, string(output))
+	require.Contains(t, string(output), "-o tun0")
+}
 
 func TestIPTablesDNSRulesForFamily(t *testing.T) {
 	if os.Getenv("SING_TUN_INTEGRATION") != "1" {
