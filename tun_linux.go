@@ -32,13 +32,14 @@ type NativeTun struct {
 	tunFd             int
 	tunFile           *os.File
 	interfaceCallback *list.Element[DefaultInterfaceUpdateCallback]
+	resolvedDNSPath   string
 	options           Options
 	routeAccess       sync.Mutex
 	dnatBypass        *autoRouteDNATBypass
 	ipvsDNSBypass     *autoRouteIPVSDNSBypass
-	ipvsDNSPending    map[ipvsDNSDestination]bool
 	serviceRoutes     [2]map[serviceRoute]bool
 	forwardPriority   [2]int
+	ipvsDNSPending    map[ipvsDNSDestination]bool
 	ruleIndex6        []int
 	readAccess        sync.Mutex
 	writeAccess       sync.Mutex
@@ -79,7 +80,7 @@ func New(options Options) (Tun, error) {
 		}
 		err = nativeTun.configure(tunLink)
 		if err != nil {
-			return nil, E.Errors(err, unix.Close(tunFd))
+			return nil, E.Errors(err, nativeTun.tunFile.Close())
 		}
 	} else {
 		nativeTun = &NativeTun{
@@ -454,7 +455,11 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 }
 
 func (t *NativeTun) rollbackAutoRoute(tunLink netlink.Link) error {
-	return E.Errors(t.removeCalicoProbeRules(), common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute0(tunLink))
+	return E.Errors(t.unsetSearchDomainForSystemdResolved(), t.removeCalicoProbeRules(), common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute0(tunLink))
+}
+
+func (t *NativeTun) removeCalicoProbeRules() error {
+	return errors.Join(t.removeCalicoFamilyProbeRules(0), t.removeCalicoFamilyProbeRules(1))
 }
 
 func (t *NativeTun) removeCalicoFamilyProbeRules(i int) error {
@@ -465,10 +470,6 @@ func (t *NativeTun) removeCalicoFamilyProbeRules(i int) error {
 		}
 	}
 	return err
-}
-
-func (t *NativeTun) removeCalicoProbeRules() error {
-	return errors.Join(t.removeCalicoFamilyProbeRules(0), t.removeCalicoFamilyProbeRules(1))
 }
 
 func (t *NativeTun) enableGSO() error {
@@ -503,10 +504,7 @@ func (t *NativeTun) Close() error {
 	}
 	t.routeAccess.Lock()
 	defer t.routeAccess.Unlock()
-	if t.options.DNSModeOrDefault() != DNSModeDisabled {
-		t.unsetSearchDomainForSystemdResolved()
-	}
-	err := t.removeCalicoProbeRules()
+	err := E.Errors(t.unsetSearchDomainForSystemdResolved(), t.removeCalicoProbeRules())
 	t.unsetAddresses()
 	return E.Errors(err, common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute(), common.Close(common.PtrOrNil(t.tunFile)))
 }
@@ -1180,33 +1178,37 @@ func (t *NativeTun) setSearchDomainForSystemdResolved() error {
 	if err != nil {
 		return nil
 	}
+	if err = shell.Exec(ctlPath, "status").Run(); err != nil {
+		return nil
+	}
 	dnsServer, err := t.options.DNSServerAddress()
 	if err != nil {
 		return err
 	}
-	go func() {
-		commands := [][]string{
-			{"domain", t.options.Name, "~."},
-			{"default-route", t.options.Name, "true"},
-			append([]string{"dns", t.options.Name}, common.Map(dnsServer, netip.Addr.String)...),
+	commands := [][]string{
+		{"domain", t.options.Name, "~."},
+		{"default-route", t.options.Name, "true"},
+		append([]string{"dns", t.options.Name}, common.Map(dnsServer, netip.Addr.String)...),
+	}
+	for _, args := range commands {
+		output, err := shell.Exec(ctlPath, args...).Read()
+		if err != nil {
+			return E.Errors(E.Extend(E.Cause(err, "set DNS configuration for interface: ", t.options.Name), output),
+				t.unsetSearchDomainForSystemdResolved())
 		}
-		for _, args := range commands {
-			output, err := shell.Exec(ctlPath, args...).Read()
-			if err != nil && t.options.Logger != nil {
-				t.options.Logger.Error(E.Extend(E.Cause(err, "set DNS configuration for interface: ", t.options.Name), output))
-			}
-		}
-	}()
+		t.resolvedDNSPath = ctlPath
+	}
 	return nil
 }
 
-func (t *NativeTun) unsetSearchDomainForSystemdResolved() {
-	ctlPath, err := exec.LookPath("resolvectl")
+func (t *NativeTun) unsetSearchDomainForSystemdResolved() error {
+	if t.resolvedDNSPath == "" {
+		return nil
+	}
+	output, err := shell.Exec(t.resolvedDNSPath, "revert", t.options.Name).Read()
 	if err != nil {
-		return
+		return E.Extend(E.Cause(err, "revert DNS configuration for interface: ", t.options.Name), output)
 	}
-	_ = shell.Exec(ctlPath, "revert", t.options.Name).Run()
-	if t.options.Logger != nil {
-		t.options.Logger.Debug("cleaned up DNS configuration for interface: ", t.options.Name)
-	}
+	t.resolvedDNSPath = ""
+	return nil
 }

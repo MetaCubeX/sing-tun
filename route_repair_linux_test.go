@@ -288,6 +288,51 @@ func TestSrcValidMarkLeaseReleasesUnusedConsumers(t *testing.T) {
 	require.Equal(t, "0", read("eth1"))
 }
 
+func TestResolvedUnavailableKeepsTUNIndependent(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	logPath := dir + "/commands"
+	t.Setenv("COMMAND_LOG", logPath)
+	require.NoError(t, os.WriteFile(dir+"/resolvectl", []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$COMMAND_LOG\"\nexit 1\n"), 0700))
+	n := NativeTun{options: Options{Name: "dns-test", DNSServers: []netip.Addr{netip.MustParseAddr("192.0.2.53")}}}
+	require.NoError(t, n.setSearchDomainForSystemdResolved())
+	require.NoError(t, n.unsetSearchDomainForSystemdResolved())
+	log, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	require.Equal(t, "status\n", string(log))
+}
+
+func TestResolvedDNSConfigRollsBackFailures(t *testing.T) {
+	for _, step := range []string{"domain", "default-route", "dns", "success"} {
+		t.Run(step, func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := dir + "/commands"
+			t.Setenv("PATH", dir)
+			t.Setenv("COMMAND_LOG", logPath)
+			t.Setenv("FAIL_STEP", step)
+			require.NoError(t, os.WriteFile(dir+"/resolvectl", []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$COMMAND_LOG\"\nif [ \"$1\" = \"$FAIL_STEP\" ]; then exit 7; fi\n"), 0700))
+			n := NativeTun{options: Options{Name: "dns-test", DNSServers: []netip.Addr{netip.MustParseAddr("192.0.2.53")}}}
+			err := n.setSearchDomainForSystemdResolved()
+			if step == "success" {
+				require.NoError(t, err)
+				require.NoError(t, n.unsetSearchDomainForSystemdResolved())
+			} else {
+				require.Error(t, err)
+				require.Empty(t, n.resolvedDNSPath)
+			}
+			log, err := os.ReadFile(logPath)
+			require.NoError(t, err)
+			expected := map[string]string{
+				"domain":        "status\ndomain\n",
+				"default-route": "status\ndomain\ndefault-route\nrevert\n",
+				"dns":           "status\ndomain\ndefault-route\ndns\nrevert\n",
+				"success":       "status\ndomain\ndefault-route\ndns\nrevert\n",
+			}
+			require.Equal(t, expected[step], string(log))
+		})
+	}
+}
+
 func TestCalicoIPv6TCPWithTruncatedOptions(t *testing.T) {
 	packet := make([]byte, 40+72+20)
 	packet[0], packet[5], packet[6], packet[7] = 0x60, 92, unix.IPPROTO_DSTOPTS, 64
