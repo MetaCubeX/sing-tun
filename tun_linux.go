@@ -33,7 +33,10 @@ type NativeTun struct {
 	tunFile           *os.File
 	interfaceCallback *list.Element[DefaultInterfaceUpdateCallback]
 	options           Options
+	routeAccess       sync.Mutex
 	dnatBypass        *autoRouteDNATBypass
+	ipvsDNSBypass     *autoRouteIPVSDNSBypass
+	ipvsDNSPending    map[ipvsDNSDestination]bool
 	ruleIndex6        []int
 	readAccess        sync.Mutex
 	writeAccess       sync.Mutex
@@ -402,6 +405,9 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 
 	if t.options.AutoRoute && runtime.GOOS != "android" {
 		t.enableAutoRouteDNATBypass(prepareAutoRouteDNATBypass)
+		if !t.options.AutoRedirectMarkMode || t.dnatBypass != nil {
+			t.enableAutoRouteIPVSDNSBypass(ipvsTablePath)
+		}
 	}
 
 	err = t.setRoute(tunLink)
@@ -414,6 +420,11 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	if err != nil {
 		return E.Errors(E.Cause(err, "cleanup rules"), t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
+	if t.dnatBypass != nil {
+		// Install the local DNS lookups before the general DNAT bypass at
+		// the same priority. Forwarded port replies keep the general rule.
+		t.dnatBypass.startDNS()
+	}
 	err = setRules(t.rules())
 	if err != nil {
 		return E.Errors(err, t.rollbackAutoRoute(tunLink))
@@ -424,6 +435,10 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 		if err != nil {
 			return E.Errors(E.Cause(err, "set search domain"), t.rollbackAutoRoute(tunLink))
 		}
+	}
+	if t.ipvsDNSBypass != nil {
+		t.refreshIPVSDNSBypass()
+		t.ipvsDNSBypass.Start(t.refreshIPVSDNSBypass)
 	}
 
 	if t.options.AutoRoute && runtime.GOOS == "android" {
@@ -460,14 +475,19 @@ func (t *NativeTun) enableGSO() error {
 }
 
 func (t *NativeTun) Close() error {
+	if t.ipvsDNSBypass != nil {
+		t.ipvsDNSBypass.Close()
+	}
 	if t.interfaceCallback != nil {
 		t.options.InterfaceMonitor.UnregisterCallback(t.interfaceCallback)
 	}
+	t.routeAccess.Lock()
+	defer t.routeAccess.Unlock()
 	if t.options.DNSModeOrDefault() != DNSModeDisabled {
 		t.unsetSearchDomainForSystemdResolved()
 	}
 	t.unsetAddresses()
-	return E.Errors(t.unsetRules(), t.unsetRoute(), common.Close(common.PtrOrNil(t.dnatBypass)), common.Close(common.PtrOrNil(t.tunFile)))
+	return E.Errors(common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute(), common.Close(common.PtrOrNil(t.tunFile)))
 }
 
 func (t *NativeTun) TXChecksumOffload() bool {
@@ -644,6 +664,18 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it.Goto = nopPriority
 			it.Family = unix.AF_INET
 			rules = append(rules, it)
+			rules = append(rules, t.translatedDNSLookupRule(unix.AF_INET, priority))
+			// Source validation swaps the ports. If the lookup still
+			// targets port 53, resume the ordinary routing policy
+			// before the reverse lookup can use the system default.
+			forward := t.translatedDNSLookupRule(unix.AF_INET, priority)
+			forward.Table = -1
+			forward.SuppressPrefixlen = -1
+			forward.Goto = priority + 1
+			reverse := t.translatedDNSLookupRule(unix.AF_INET, priority)
+			reverse.Sport, reverse.Dport = reverse.Dport, nil
+			reverse.SuppressPrefixlen = -1
+			rules = append(rules, forward, reverse)
 			priority++
 		}
 		if p6 {
@@ -655,6 +687,19 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it.Goto = nopPriority
 			it.Family = unix.AF_INET6
 			rules = append(rules, it)
+			rules = append(rules, t.translatedDNSLookupRule(unix.AF_INET6, priority6))
+			priority6++
+		}
+	}
+	if t.ipvsDNSBypass != nil {
+		for _, destination := range t.ipvsDNSBypass.Destinations() {
+			rules = append(rules, t.ipvsDNSRules(destination)...)
+		}
+		// Keep later policy priorities stable while IPVS backends change.
+		if p4 {
+			priority++
+		}
+		if p6 {
 			priority6++
 		}
 	}
@@ -995,7 +1040,7 @@ func (t *NativeTun) setRoute(tunLink netlink.Link) error {
 
 func setRules(rules []*netlink.Rule) error {
 	for i, rule := range rules {
-		err := netlink.RuleAdd(rule)
+		err := addAutoRouteRule(rule)
 		if err != nil {
 			if rule.Type == unix.FR_ACT_UNREACHABLE && errors.Is(err, unix.EAFNOSUPPORT) {
 				socketFd, socketErr := unix.Socket(rule.Family, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
@@ -1098,6 +1143,8 @@ func (t *NativeTun) routeUpdate(_ *control.Interface, flags int) {
 	if flags&FlagAndroidVPNUpdate == 0 {
 		return
 	}
+	t.routeAccess.Lock()
+	defer t.routeAccess.Unlock()
 	err := t.resetRules()
 	if err != nil {
 		if t.options.Logger != nil {

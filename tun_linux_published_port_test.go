@@ -3,6 +3,7 @@
 package tun
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -54,48 +55,65 @@ func bindReadonlySysctl(t *testing.T, path string) {
 func TestPublishedPortWithLooseRPFilter(t *testing.T) {
 	for _, access := range []string{"writable", "readonly"} {
 		t.Run(access, func(t *testing.T) {
-			runCalicoIntegration(t, func() {
-				setupForwardingPeers(t, "backend0")
-				runTestIP(t, "-n", "client", "addr", "add", "203.0.113.7/32", "dev", "lo")
-				runTestIP(t, "route", "add", "default", "via", "192.0.2.2")
-				require.NoError(t, os.WriteFile(ipv4ConfPath+"/all/rp_filter", []byte("2"), 0))
-				require.NoError(t, os.WriteFile(srcValidMarkPath, []byte("0"), 0))
-				if access == "readonly" {
-					bindReadonlySysctl(t, srcValidMarkPath)
-				}
-				rules := exec.Command("nft", "-f", "-")
-				rules.Stdin = strings.NewReader(`table ip test_published_port {
-chain prerouting { type nat hook prerouting priority dstnat; iifname "edge0" ip daddr 192.0.2.1 tcp dport 30080 dnat to 10.85.1.27:18888; }
-}`)
-				out, err := rules.CombinedOutput()
-				require.NoError(t, err, string(out))
-				server := exec.Command("ip", "netns", "exec", "backend", "socat", "TCP4-LISTEN:18888,bind=10.85.1.27,reuseaddr,fork", "EXEC:/bin/cat")
-				require.NoError(t, server.Start())
-				t.Cleanup(func() { _ = server.Process.Kill(); _ = server.Wait() })
-				require.Eventually(t, func() bool {
-					b, _ := exec.Command("ip", "netns", "exec", "backend", "ss", "-ltn").Output()
-					return strings.Contains(string(b), "10.85.1.27:18888")
-				}, 3*time.Second, 20*time.Millisecond)
-				exchange := func(payload string) {
-					t.Helper()
-					cmd := exec.Command("ip", "netns", "exec", "client", "socat", "-t", "1", "-T", "2", "-", "TCP4:192.0.2.1:30080,bind=203.0.113.7,connect-timeout=2")
-					cmd.Stdin = strings.NewReader(payload)
-					out, err := cmd.CombinedOutput()
-					require.NoError(t, err, "published TCP port %s: %s", payload, out)
-					require.Equal(t, payload, string(out))
-				}
-				exchange("before TUN")
-				t.Cleanup(func() {
-					value, err := os.ReadFile(srcValidMarkPath)
-					require.NoError(t, err)
-					require.Equal(t, "0", strings.TrimSpace(string(value)), "loose source validation after TUN shutdown")
-				})
-				startTestAutoRoute(t, 0)
-				exchange("with TUN")
-				value, err := os.ReadFile(srcValidMarkPath)
-				require.NoError(t, err)
-				require.Equal(t, "0", strings.TrimSpace(string(value)), "loose source validation with TUN active")
-			})
+			runCalicoIntegration(t, func() { checkPublishedPortRPFilter(t, "2", "0", access == "readonly", 18888) })
 		})
 	}
+}
+
+func TestPublishedPortWithStrictRPFilter(t *testing.T) {
+	for _, port := range []int{18888, 53} {
+		t.Run(fmt.Sprint(port), func(t *testing.T) {
+			runCalicoIntegration(t, func() { checkPublishedPortRPFilter(t, "1", "1", false, port) })
+		})
+	}
+}
+
+func checkPublishedPortRPFilter(t *testing.T, filter, mark string, readOnly bool, backendPort int) {
+	t.Helper()
+	setupForwardingPeers(t, "backend0")
+	runTestIP(t, "-n", "client", "addr", "add", "203.0.113.7/32", "dev", "lo")
+	runTestIP(t, "route", "add", "default", "via", "192.0.2.2")
+	require.NoError(t, os.WriteFile(ipv4ConfPath+"/all/rp_filter", []byte(filter), 0))
+	require.NoError(t, os.WriteFile(srcValidMarkPath, []byte("0"), 0))
+	require.NoError(t, os.WriteFile(ipv4ConfPath+"/edge0/src_valid_mark", []byte("0"), 0))
+	if readOnly {
+		bindReadonlySysctl(t, srcValidMarkPath)
+	}
+	rules := exec.Command("nft", "-f", "-")
+	rules.Stdin = strings.NewReader(fmt.Sprintf(`table ip test_published_port {
+chain prerouting { type nat hook prerouting priority dstnat; iifname "edge0" ip daddr 192.0.2.1 tcp dport 30080 dnat to 10.85.1.27:%d; }
+}`, backendPort))
+	out, err := rules.CombinedOutput()
+	require.NoError(t, err, string(out))
+	server := exec.Command("ip", "netns", "exec", "backend", "socat", fmt.Sprintf("TCP4-LISTEN:%d,bind=10.85.1.27,reuseaddr,fork", backendPort), "EXEC:/bin/cat")
+	require.NoError(t, server.Start())
+	t.Cleanup(func() { _ = server.Process.Kill(); _ = server.Wait() })
+	require.Eventually(t, func() bool {
+		b, _ := exec.Command("ip", "netns", "exec", "backend", "ss", "-ltn").Output()
+		return strings.Contains(string(b), fmt.Sprintf("10.85.1.27:%d", backendPort))
+	}, 3*time.Second, 20*time.Millisecond)
+	exchange := func(payload string) {
+		t.Helper()
+		cmd := exec.Command("ip", "netns", "exec", "client", "socat", "-t", "1", "-T", "2", "-", "TCP4:192.0.2.1:30080,bind=203.0.113.7,connect-timeout=2")
+		cmd.Stdin = strings.NewReader(payload)
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "published TCP port %s: %s", payload, out)
+		require.Equal(t, payload, string(out))
+	}
+	exchange("before TUN")
+	{
+		t.Cleanup(func() {
+			value, err := os.ReadFile(srcValidMarkPath)
+			require.NoError(t, err)
+			require.Equal(t, "0", strings.TrimSpace(string(value)), "namespace source validation after TUN shutdown")
+			value, err = os.ReadFile(ipv4ConfPath + "/edge0/src_valid_mark")
+			require.NoError(t, err)
+			require.Equal(t, "0", strings.TrimSpace(string(value)))
+		})
+	}
+	startTestAutoRoute(t, 0)
+	exchange("with TUN")
+	value, err := os.ReadFile(ipv4ConfPath + "/edge0/src_valid_mark")
+	require.NoError(t, err)
+	require.Equal(t, mark, strings.TrimSpace(string(value)), "source validation with TUN active")
 }
