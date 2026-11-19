@@ -158,7 +158,7 @@ func (s *System) start() error {
 	if s.inet6NextAddress.IsValid() {
 		address := net.JoinHostPort(s.inet6Address.String(), "0")
 		if s.enforceBind {
-			address = "[:]:0"
+			address = "[::]:0"
 		}
 		for i := 0; i < 3; i++ {
 			tcpListener, err = listener.Listen(s.ctx, "tcp6", address)
