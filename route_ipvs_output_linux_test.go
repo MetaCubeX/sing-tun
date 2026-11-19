@@ -73,3 +73,76 @@ func TestIPVSDNSOutputUpdateRetry(t *testing.T) {
 		})
 	}
 }
+
+func TestIPVSDNSUpdateKeepsHealthyFamilyIndependent(t *testing.T) {
+	runCalicoIntegration(t, func() {
+		setupForwardingPeers(t, "backend0")
+		n := startTestAutoRoute(t, 0)
+		n.routeAccess.Lock()
+		defer n.routeAccess.Unlock()
+		b := n.dnatBypass
+		useLegacyServiceFirewall(t, b)
+		ipvs := func(args ...string) {
+			t.Helper()
+			out, err := exec.Command("ipvsadm", args...).CombinedOutput()
+			require.NoError(t, err, "%v: %s", args, out)
+		}
+
+		const vip4 = "10.96.0.53:53"
+		const vip6 = "[fd52:96::53]:53"
+		previous := netip.MustParseAddrPort("10.85.1.27:53")
+		replacement := netip.MustParseAddrPort("10.85.1.28:53")
+		backend6 := netip.MustParseAddrPort("[fd52:1::27]:53")
+		ipvs("-A", "-u", vip4, "-s", "rr")
+		ipvs("-a", "-u", vip4, "-r", previous.String(), "-m")
+		before, err := n.ipvsDNSBypass.Load()
+		require.NoError(t, err)
+		require.Equal(t, []ipvsDNSDestination{{unix.IPPROTO_UDP, previous}}, before)
+		current, err := n.updateIPVSDNSRules(nil, before, addIPVSDNSRule, deleteIPVSDNSRule)
+		require.NoError(t, err)
+		hasIPVSRule := func(endpoint netip.AddrPort) bool {
+			rules, err := netlink.RuleList(netlink.FAMILY_V4)
+			require.NoError(t, err)
+			expected := n.ipvsDNSRules(ipvsDNSDestination{unix.IPPROTO_UDP, endpoint})[0]
+			for _, rule := range rules {
+				if rule.Dst == expected.Dst && rule.Mark == expected.Mark && rule.IifName == "lo" &&
+					rule.Table == expected.Table && rule.IPProto == expected.IPProto &&
+					rule.Dport != nil && *rule.Dport == *expected.Dport {
+					return true
+				}
+			}
+			return false
+		}
+		require.True(t, hasIPVSRule(previous))
+		require.False(t, hasIPVSRule(replacement))
+
+		ipvs("-d", "-u", vip4, "-r", previous.String())
+		ipvs("-a", "-u", vip4, "-r", replacement.String(), "-m")
+		ipvs("-A", "-u", vip6, "-s", "rr")
+		ipvs("-a", "-u", vip6, "-r", backend6.String(), "-m")
+		after, err := n.ipvsDNSBypass.Load()
+		require.NoError(t, err)
+		require.Equal(t, []ipvsDNSDestination{{unix.IPPROTO_UDP, replacement}, {unix.IPPROTO_UDP, backend6}}, after)
+
+		path := b.ip6tablesPath
+		defer func() { b.ip6tablesPath = path }()
+		b.ip6tablesPath = filepath.Join(t.TempDir(), "unavailable-ip6tables")
+		current, err = n.updateIPVSDNSRules(current, after, addIPVSDNSRule, deleteIPVSDNSRule)
+		require.ErrorContains(t, err, b.ip6tablesPath+"-restore")
+		output, err := exec.Command(b.iptablesPath, "-t", "mangle", "-S", b.ipvsOutputChain()).CombinedOutput()
+		require.NoError(t, err, string(output))
+		require.Contains(t, string(output), "-d 10.85.1.28/32")
+		require.NotContains(t, string(output), "-d 10.85.1.27/32")
+		require.True(t, hasIPVSRule(replacement))
+		require.False(t, hasIPVSRule(previous), "the IPv4 classifier has already retired this backend")
+		for _, endpoint := range []netip.AddrPort{previous, replacement} {
+			require.Contains(t, runTestIP(t, "-4", "route", "get", endpoint.Addr().String(), "ipproto", "udp", "dport", "53"), "dev test-tun ")
+		}
+
+		b.ip6tablesPath = path
+		current, err = n.updateIPVSDNSRules(current, after, addIPVSDNSRule, deleteIPVSDNSRule)
+		require.NoError(t, err)
+		require.Equal(t, after, current)
+		require.Equal(t, after[1:], b.ipvsOutput[1])
+	})
+}

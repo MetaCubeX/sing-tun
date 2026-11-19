@@ -37,7 +37,8 @@ type NativeTun struct {
 	dnatBypass        *autoRouteDNATBypass
 	ipvsDNSBypass     *autoRouteIPVSDNSBypass
 	ipvsDNSPending    map[ipvsDNSDestination]bool
-	serviceRoutes     map[serviceRoute]bool
+	serviceRoutes     [2]map[serviceRoute]bool
+	forwardPriority   [2]int
 	ruleIndex6        []int
 	readAccess        sync.Mutex
 	writeAccess       sync.Mutex
@@ -453,7 +454,21 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 }
 
 func (t *NativeTun) rollbackAutoRoute(tunLink netlink.Link) error {
-	return E.Errors(common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute0(tunLink))
+	return E.Errors(t.removeCalicoProbeRules(), common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute0(tunLink))
+}
+
+func (t *NativeTun) removeCalicoFamilyProbeRules(i int) error {
+	var err error
+	for path := range t.serviceRoutes[i] {
+		if path.isCalicoProbe() {
+			err = errors.Join(err, t.removeServiceRoute(path))
+		}
+	}
+	return err
+}
+
+func (t *NativeTun) removeCalicoProbeRules() error {
+	return errors.Join(t.removeCalicoFamilyProbeRules(0), t.removeCalicoFamilyProbeRules(1))
 }
 
 func (t *NativeTun) enableGSO() error {
@@ -491,8 +506,9 @@ func (t *NativeTun) Close() error {
 	if t.options.DNSModeOrDefault() != DNSModeDisabled {
 		t.unsetSearchDomainForSystemdResolved()
 	}
+	err := t.removeCalicoProbeRules()
 	t.unsetAddresses()
-	return E.Errors(common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute(), common.Close(common.PtrOrNil(t.tunFile)))
+	return E.Errors(err, common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute(), common.Close(common.PtrOrNil(t.tunFile)))
 }
 
 func (t *NativeTun) TXChecksumOffload() bool {
@@ -935,6 +951,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			rules = append(rules, it)
 		}
 	}
+	t.forwardPriority = [2]int{priority, priority6}
 	if p4 {
 		it = netlink.NewRule()
 		it.Priority = priority

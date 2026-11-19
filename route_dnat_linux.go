@@ -47,6 +47,8 @@ type autoRouteDNATBypass struct {
 	ipvsOutput    [2][]ipvsDNSDestination
 	dnsRules      [2][]*netlink.Rule
 	forwardScopes [2]serviceForwardScope
+	calicoQueue   *calicoServiceQueue
+	serviceEvents chan<- struct{}
 }
 
 func (t *NativeTun) enableAutoRouteDNATBypass(
@@ -182,6 +184,10 @@ func (b *autoRouteDNATBypass) Start() error {
 
 func (b *autoRouteDNATBypass) Close() error {
 	err := errors.Join(b.cleanupDNS(), b.cleanupBase())
+	if b.calicoQueue != nil {
+		b.calicoQueue.Close()
+		b.calicoQueue = nil
+	}
 	if err == nil {
 		err = b.srcValidMarks.close()
 	}
@@ -525,11 +531,16 @@ func (b *autoRouteDNATBypass) cleanupIPTables() error {
 
 func (b *autoRouteDNATBypass) cleanupIPTablesPath(path string) error {
 	return errors.Join(cleanupIPTablesChain(path, "mangle", "PREROUTING", b.chainName),
-		cleanupIPTablesChain(path, "mangle", "OUTPUT", b.ipvsOutputChain()), b.cleanupIPTablesServiceForward(path))
+		cleanupIPTablesChain(path, "mangle", "OUTPUT", b.ipvsOutputChain()),
+		cleanupIPTablesChain(path, "mangle", "PREROUTING", b.ipvsReplyChain()), b.cleanupIPTablesServiceForward(path))
 }
 
 func (b *autoRouteDNATBypass) cleanupIPTablesServiceForward(path string) error {
-	return errors.Join(cleanupIPTablesChain(path, "mangle", "PREROUTING", b.chainName+"-FWD"), cleanupIPTablesChain(path, "mangle", "INPUT", b.chainName+"-INPUT"), cleanupIPTablesChain(path, "mangle", "FORWARD", b.chainName+"-FORWARD"))
+	return errors.Join(cleanupIPTablesChain(path, "mangle", "PREROUTING", b.chainName+"-FWD"),
+		cleanupIPTablesChain(path, "mangle", "", b.chainName+"-QUEUE"),
+		cleanupIPTablesChain(path, "mangle", "INPUT", b.chainName+"-INPUT"),
+		cleanupIPTablesChain(path, "mangle", "FORWARD", b.chainName+"-FORWARD"),
+		cleanupIPTablesChain(path, "mangle", "POSTROUTING", b.chainName+"-POST"))
 }
 
 func cleanupIPTablesChain(path, table, hook, chain string) error {

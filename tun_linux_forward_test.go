@@ -72,15 +72,24 @@ func TestAutoRoutePreservesForwardedServiceReply(t *testing.T) {
 	if os.Getenv("SING_TUN_INTEGRATION") != "1" {
 		t.Skip("requires a private Linux network namespace, iproute2 and socat")
 	}
-	t.Run("cilium_host", func(t *testing.T) { checkForwardedService(t, "cilium_host", 0) })
-	t.Run("cilium_host_high_output_mark", func(t *testing.T) { checkForwardedService(t, "cilium_host", 0x10000) })
+	for _, backend := range []string{"cali-backend", "cilium_host"} {
+		t.Run(backend, func(t *testing.T) { checkForwardedService(t, backend, 0, "") })
+	}
+	t.Run("cilium_host_high_output_mark", func(t *testing.T) { checkForwardedService(t, "cilium_host", 0x10000, "") })
+	for _, mode := range []string{"dnat", "preexisting-connmark", "ecmp"} {
+		t.Run(mode, func(t *testing.T) { checkForwardedService(t, "cilium_host", 0, mode) })
+	}
 }
 
-func checkForwardedService(t *testing.T, backend string, outputMark uint32) {
+func checkForwardedService(t *testing.T, backend string, outputMark uint32, mode string) {
 	t.Helper()
 	gateways := []string{"192.0.2.1/24", "198.51.100.1/24"}
 	peers := []string{"192.0.2.2/24", "198.51.100.2/24"}
 	names := []string{fmt.Sprintf("st-client-%d", os.Getpid()), fmt.Sprintf("st-pod-%d", os.Getpid())}
+	if backend == "cali-backend" {
+		runTestIP(t, "link", "add", "bpfin.cali", "type", "veth", "peer", "name", "bpfout.cali")
+		t.Cleanup(func() { _ = exec.Command("ip", "link", "del", "bpfin.cali").Run() })
+	}
 	for i, ns := range names {
 		ns := ns
 		dev := []string{"edge0", backend}[i]
@@ -96,9 +105,19 @@ func checkForwardedService(t *testing.T, backend string, outputMark uint32) {
 		runTestIP(t, "-n", ns, "route", "add", "default", "via", netip.MustParsePrefix(gateways[i]).Addr().String())
 	}
 	runTestIP(t, "-n", names[0], "addr", "add", "203.0.113.7/32", "dev", "lo")
-	runTestIP(t, "route", "add", "default", "via", "192.0.2.2")
+	if mode == "ecmp" {
+		runTestIP(t, "-n", names[0], "addr", "add", "192.0.2.3/24", "dev", "peer0")
+		runTestIP(t, "route", "add", "default", "nexthop", "via", "192.0.2.2", "dev", "edge0", "nexthop", "via", "192.0.2.3", "dev", "edge0")
+	} else {
+		runTestIP(t, "route", "add", "default", "via", "192.0.2.2")
+	}
 	runTestIP(t, "-n", names[1], "address", "add", "10.85.1.27/32", "dev", "peer0")
-	runTestIP(t, "route", "add", "10.85.1.0/24", "via", "198.51.100.2", "dev", backend)
+	target := "10.85.1.27"
+	if backend == "cilium_host" {
+		runTestIP(t, "route", "add", "10.85.1.0/24", "via", "198.51.100.2", "dev", backend)
+	} else {
+		runTestIP(t, "route", "add", "10.85.1.27/32", "dev", backend)
+	}
 	require.NoError(t, os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0))
 	require.NoError(t, os.WriteFile("/proc/sys/net/ipv4/conf/all/rp_filter", []byte("1"), 0))
 	server := exec.Command("ip", "netns", "exec", names[1], os.Args[0], "-test.run=^TestAutoRoutePreservesForwardedServiceReply$")
@@ -109,20 +128,32 @@ func checkForwardedService(t *testing.T, backend string, outputMark uint32) {
 		b, _ := exec.Command("ip", "netns", "exec", names[1], "ss", "-lun").Output()
 		return strings.Contains(string(b), ":18888 ")
 	}, 3*time.Second, 20*time.Millisecond)
-	// Include a nonzero cluster ID. Both parts of the Cilium security
-	// identity must still be available to forwarding policy after routing.
-	cmd := exec.Command("nft", "-f", "-")
-	cmd.Stdin = strings.NewReader(
-		"table inet service_identity_test {\n" +
-			"chain ingress { type filter hook prerouting priority raw; iifname \"cilium_host\" ip saddr 10.85.1.27 meta mark set 0xbf2a0f5a; }\n" +
-			"chain verify_forwarding { type filter hook forward priority filter; ip daddr 10.85.1.27 udp dport 18888 ct mark != 0 ct mark set ct mark | 0x40000000; ip saddr 10.85.1.27 udp sport 18888 meta mark != 0xbf2a0f5a drop; }\n}\n")
-	output, err := cmd.CombinedOutput()
-	require.NoError(t, err, string(output))
-	t.Cleanup(func() {
-		require.NoError(t, exec.Command("nft", "delete", "table", "inet", "service_identity_test").Run())
-	})
+	if backend == "cilium_host" {
+		// Include a nonzero cluster ID. Both parts of the Cilium security
+		// identity must still be available to forwarding policy after routing.
+		cmd := exec.Command("nft", "-f", "-")
+		var extra string
+		switch mode {
+		case "dnat":
+			target = "192.0.2.1"
+			runTestIP(t, "route", "add", "203.0.113.7/32", "via", "192.0.2.2", "dev", "edge0")
+			extra = "chain published { type nat hook prerouting priority dstnat; iifname \"edge0\" ip daddr 192.0.2.1 udp dport 18888 dnat ip to 10.85.1.27; }\n"
+		case "preexisting-connmark":
+			extra = "chain foreign_mark { type filter hook prerouting priority mangle; iifname \"edge0\" ip daddr 10.85.1.27 udp dport 18888 ct mark set ct mark | 0x40000000; }\n"
+		}
+		cmd.Stdin = strings.NewReader(
+			"table inet service_identity_test {\n" +
+				extra +
+				"chain ingress { type filter hook prerouting priority raw; iifname \"cilium_host\" ip saddr 10.85.1.27 meta mark set 0xbf2a0f5a; }\n" +
+				"chain verify_forwarding { type filter hook forward priority filter; ip daddr 10.85.1.27 udp dport 18888 ct mark != 0 ct mark set ct mark | 0x40000000; ip saddr 10.85.1.27 udp sport 18888 meta mark != 0xbf2a0f5a drop; }\n}\n")
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, string(output))
+		t.Cleanup(func() {
+			require.NoError(t, exec.Command("nft", "delete", "table", "inet", "service_identity_test").Run())
+		})
+	}
 	echo := func(payload string) string {
-		cmd := exec.Command("ip", "netns", "exec", names[0], "socat", "-t", "1", "-T", "2", "-", "UDP4:10.85.1.27:18888,bind=203.0.113.7")
+		cmd := exec.Command("ip", "netns", "exec", names[0], "socat", "-t", "1", "-T", "2", "-", "UDP4:"+target+":18888,bind=203.0.113.7")
 		cmd.Stdin = strings.NewReader(payload)
 		b, err := cmd.CombinedOutput()
 		require.NoError(t, err, string(b))
@@ -134,10 +165,25 @@ func checkForwardedService(t *testing.T, backend string, outputMark uint32) {
 	listing, err := exec.Command("nft", "list", "table", "inet", n.dnatBypass.tableName).CombinedOutput()
 	require.NoError(t, err, string(listing))
 	checkTraffic := func() {
+		if backend == "cali-backend" {
+			for _, port := range []string{"53", "18888"} {
+				probe := exec.Command("ip", "route", "get", "10.85.1.27", "from", "192.0.2.2", "iif", "edge0", "mark", "0", "ipproto", "udp", "sport", "49152", "dport", port)
+				probe.Env = append(os.Environ(), "LC_ALL=C")
+				output, err := probe.CombinedOutput()
+				require.Error(t, err, "unmarked BPF probe to port %s bypassed host conntrack: %s", port, output)
+				require.Contains(t, string(output), "unreachable")
+			}
+		}
 		require.Equal(t, "after", echo("after"))
-		ct, err := exec.Command("conntrack", "-L", "-p", "udp", "--orig-src", "203.0.113.7", "--orig-dst", "10.85.1.27", "--dport", "18888").CombinedOutput()
-		require.NoError(t, err, string(ct))
-		require.Contains(t, string(ct), fmt.Sprintf("mark=%d", n.options.autoRouteOutputMark()|0x40000000))
+		if mode == "dnat" {
+			// This replay pins the client's route to the physical peer.
+			return
+		}
+		if backend == "cilium_host" && mode != "dnat" {
+			ct, err := exec.Command("conntrack", "-L", "-p", "udp", "--orig-src", "203.0.113.7", "--orig-dst", "10.85.1.27", "--dport", "18888").CombinedOutput()
+			require.NoError(t, err, string(ct))
+			require.Contains(t, string(ct), fmt.Sprintf("mark=%d", n.options.autoRouteOutputMark()|0x40000000))
+		}
 		outbound := exec.Command("ip", "netns", "exec", names[1], "socat", "-u", "-", "UDP4:203.0.113.7:18889,bind=10.85.1.27")
 		outbound.Stdin = strings.NewReader("new-outbound")
 		require.NoError(t, outbound.Run())

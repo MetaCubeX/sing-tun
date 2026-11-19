@@ -37,6 +37,8 @@ func (b *autoRouteDNATBypass) dnsRoutingMark() (uint32, uint32) {
 	return b.options.autoRouteDNATBypassMark() | (bit &^ output), mask | bit
 }
 
+// A translated DNS request can follow a specific backend route. IPVS
+// reinjection in OUTPUT also has a scoped rule for its configured endpoints.
 func (t *NativeTun) translatedDNSLookupRule(family, priority int) *netlink.Rule {
 	rule := netlink.NewRule()
 	mark, mask := t.options.translatedDNSRoutingMark()

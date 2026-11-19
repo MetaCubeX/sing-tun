@@ -3,6 +3,7 @@
 package tun
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
@@ -83,6 +84,80 @@ func TestLocalDNATDestinationsFollowAddressChanges(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestServiceDiscoveryFailureKeepsOtherFamilyUpdating(t *testing.T) {
+	runCalicoIntegration(t, func() {
+		n := &NativeTun{options: Options{IPRoute2RuleIndex: 19000}}
+		dns := serviceRoute{prefix: netip.MustParsePrefix("192.0.2.10/32"), lookupBits: 32}
+		discoveryErr := fmt.Errorf("IPv6 interface disappeared")
+		next := [2]serviceRoutePlan{{routes: map[serviceRoute]bool{dns: true}}, {discoveryErr: discoveryErr}}
+		require.ErrorIs(t, n.syncServicePlans(next), discoveryErr)
+		require.True(t, n.serviceRoutes[0][dns])
+		require.Contains(t, runTestIP(t, "-4", "rule", "show"), "to 192.0.2.10 dport 53")
+	})
+}
+
+func TestLegacyDNATReplyKeepsExplicitInputMark(t *testing.T) {
+	runCalicoIntegration(t, func() {
+		setupForwardingPeers(t, "backend0")
+		for _, iface := range []string{"all", "edge0", "backend0"} {
+			require.NoError(t, os.WriteFile(ipv4ConfPath+"/"+iface+"/rp_filter", []byte("0"), 0))
+		}
+		runTestIP(t, "-n", "client", "addr", "add", "203.0.113.7/32", "dev", "lo")
+		runTestIP(t, "route", "add", "default", "via", "192.0.2.2")
+		cmd := exec.Command("nft", "-f", "-")
+		cmd.Stdin = strings.NewReader(`table ip reply_mark_test {
+chain published { type nat hook prerouting priority dstnat; iifname "edge0" udp dport 30080 dnat to 10.85.1.27:18888; }
+chain tag { type filter hook prerouting priority mangle - 1; iifname "backend0" udp dport 48882 meta mark set 0x2023; }
+chain record { type filter hook prerouting priority mangle + 1; iifname "backend0" udp sport 18888 ct mark set meta mark; }
+}`)
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, string(out))
+		device, err := New(Options{Name: "test-tun", MTU: 1500, AutoRoute: true, DNSMode: DNSModeDisabled,
+			Inet4Address:       []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
+			IPRoute2TableIndex: 19001, IPRoute2RuleIndex: 19000, AutoRedirectMarkMode: true,
+			AutoRedirectInputMark: DefaultAutoRedirectInputMark, AutoRedirectOutputMark: DefaultAutoRedirectOutputMark,
+			IPRoute2AutoRedirectFallbackRuleIndex: DefaultIPRoute2AutoRedirectFallbackRuleIndex})
+		require.NoError(t, err)
+		n := device.(*NativeTun)
+		t.Cleanup(func() { require.NoError(t, n.Close()) })
+		n.routeAccess.Lock()
+		func() {
+			defer n.routeAccess.Unlock()
+			useLegacyServiceFirewall(t, n.dnatBypass)
+		}()
+		require.Contains(t, runTestIP(t, "-4", "route", "get", "203.0.113.7", "from", "10.85.1.27", "iif", "backend0", "mark", "0x2023"), "dev test-tun")
+		server := exec.Command("ip", "netns", "exec", "backend", "python3", "-c",
+			"import socket; s=socket.socket(type=socket.SOCK_DGRAM); s.bind(('10.85.1.27',18888)); "+
+				"exec('while True:\\n data,peer=s.recvfrom(1024)\\n s.sendto(data,peer)')")
+		require.NoError(t, server.Start())
+		t.Cleanup(func() { _ = server.Process.Kill(); _ = server.Wait() })
+		require.Eventually(t, func() bool {
+			out, _ := exec.Command("ip", "netns", "exec", "backend", "ss", "-lun").Output()
+			return strings.Contains(string(out), ":18888 ")
+		}, time.Second, 20*time.Millisecond)
+		for _, tc := range []struct {
+			port, payload string
+			mark          uint32
+		}{{"48881", "native-reply", n.options.autoRouteDNATBypassMark()}, {"48882", "tun-reply", DefaultAutoRedirectInputMark}} {
+			cmd := exec.Command("ip", "netns", "exec", "client", "python3", "-c",
+				"import socket,sys; s=socket.socket(type=socket.SOCK_DGRAM); s.bind(('203.0.113.7',int(sys.argv[1]))); s.settimeout(.4); "+
+					"s.sendto(sys.argv[2].encode(),('192.0.2.1',30080)); "+
+					"exec('try: print(s.recv(1024).decode())\\nexcept TimeoutError: pass')", tc.port, tc.payload)
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+			marks, err := exec.Command("conntrack", "-L", "-p", "udp", "--sport", tc.port, "--dport", "30080").CombinedOutput()
+			require.NoError(t, err, string(marks))
+			require.Contains(t, string(marks), fmt.Sprintf("mark=%d ", tc.mark))
+			if tc.mark == DefaultAutoRedirectInputMark {
+				require.Empty(t, out)
+				readCalicoTestTUN(t, n, tc.payload)
+			} else {
+				require.Equal(t, tc.payload, strings.TrimSpace(string(out)))
+			}
+		}
+	})
 }
 
 func TestLegacyGatewayDNSPreservesRoutedHostClients(t *testing.T) {
@@ -213,24 +288,17 @@ func TestSrcValidMarkLeaseReleasesUnusedConsumers(t *testing.T) {
 	require.Equal(t, "0", read("eth1"))
 }
 
-func readCalicoTestTUN(t *testing.T, n *NativeTun, token string) {
-	t.Helper()
-	for deadline := time.Now().Add(1500 * time.Millisecond); time.Now().Before(deadline); {
-		fds := []unix.PollFd{{Fd: int32(n.tunFd), Events: unix.POLLIN}}
-		ready, e := unix.Poll(fds, int(time.Until(deadline).Milliseconds()))
-		if e == unix.EINTR {
-			continue
-		}
-		require.NoError(t, e)
-		if ready == 0 {
-			break
-		}
-		buf := make([]byte, 1500)
-		size, e := n.Read(buf)
-		require.NoError(t, e)
-		if size >= 28 && buf[0] == 0x45 && buf[9] == unix.IPPROTO_UDP && string(buf[28:size]) == token {
-			return
-		}
-	}
-	t.Fatalf("ordinary packet %q did not reach TUN", token)
+func TestCalicoIPv6TCPWithTruncatedOptions(t *testing.T) {
+	packet := make([]byte, 40+72+20)
+	packet[0], packet[5], packet[6], packet[7] = 0x60, 92, unix.IPPROTO_DSTOPTS, 64
+	packet[40], packet[41] = unix.IPPROTO_TCP, 8
+	binary.BigEndian.PutUint16(packet[112:], 18888)
+	binary.BigEndian.PutUint16(packet[114:], 49152)
+	packet[124] = 0x50
+	flow, ok := parseCalicoUntrackedTCP(packet[:128], unix.AF_INET6)
+	require.True(t, ok)
+	require.Equal(t, uint16(18888), flow.sourcePort)
+	require.Equal(t, uint16(49152), flow.destinationPort)
+	_, ok = parseCalicoUntrackedTCP(packet[:115], unix.AF_INET6)
+	require.False(t, ok)
 }

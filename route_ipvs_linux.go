@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,12 +32,14 @@ const (
 type autoRouteIPVSDNSBypass struct {
 	path string
 
-	access       sync.RWMutex
-	destinations []ipvsDNSDestination
-	started      bool
-	closeOnce    sync.Once
-	stop         chan struct{}
-	done         chan struct{}
+	topologyVersion atomic.Uint64
+	access          sync.RWMutex
+	destinations    []ipvsDNSDestination
+	started         bool
+	closeOnce       sync.Once
+	events          chan struct{}
+	stop            chan struct{}
+	done            chan struct{}
 }
 
 type ipvsDNSDestination struct {
@@ -46,9 +49,10 @@ type ipvsDNSDestination struct {
 
 func newAutoRouteIPVSDNSBypass(path string) (*autoRouteIPVSDNSBypass, error) {
 	bypass := &autoRouteIPVSDNSBypass{
-		path: path,
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
+		path:   path,
+		events: make(chan struct{}, 1),
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
 	}
 	destinations, err := bypass.Load()
 	if err == nil {
@@ -75,18 +79,18 @@ func (b *autoRouteIPVSDNSBypass) Start(update func()) error {
 	if b.started {
 		return nil
 	}
-	routes, err := subscribeAutoRouteNetlink(unix.NETLINK_ROUTE, unix.RTNLGRP_IPV4_ROUTE, unix.RTNLGRP_IPV6_ROUTE)
+	routes, err := subscribeAutoRouteNetlink(unix.NETLINK_ROUTE, unix.RTNLGRP_IPV4_ROUTE, unix.RTNLGRP_IPV6_ROUTE,
+		unix.RTNLGRP_LINK, unix.RTNLGRP_IPV4_IFADDR, unix.RTNLGRP_IPV6_IFADDR)
 	if err != nil {
 		return err
 	}
-	events := make(chan struct{}, 1)
 	var listeners sync.WaitGroup
 	listeners.Add(1)
 	go func() {
 		defer listeners.Done()
 		notify := func() {
 			select {
-			case events <- struct{}{}:
+			case b.events <- struct{}{}:
 			default:
 			}
 		}
@@ -94,10 +98,12 @@ func (b *autoRouteIPVSDNSBypass) Start(update func()) error {
 			messages, from, err := routes.Receive()
 			if errors.Is(err, unix.ENOBUFS) {
 				// Rebuild from a complete snapshot after lost route events.
+				b.topologyVersion.Add(1)
 				notify()
 				continue
 			}
 			if err != nil {
+				b.topologyVersion.Add(1)
 				return
 			}
 			if from.Pid != nl.PidKernel {
@@ -113,6 +119,7 @@ func (b *autoRouteIPVSDNSBypass) Start(update func()) error {
 				}
 			}
 			if topologyChanged {
+				b.topologyVersion.Add(1)
 			}
 			if topologyChanged || routeChanged {
 				notify()
@@ -132,7 +139,7 @@ func (b *autoRouteIPVSDNSBypass) Start(update func()) error {
 			default:
 			}
 			select {
-			case <-events:
+			case <-b.events:
 				update()
 			case <-ticker.C:
 				update()
@@ -178,6 +185,9 @@ func (b *autoRouteIPVSDNSBypass) Replace(destinations []ipvsDNSDestination) {
 func (t *NativeTun) enableAutoRouteIPVSDNSBypass(path string) {
 	bypass, err := newAutoRouteIPVSDNSBypass(path)
 	t.ipvsDNSBypass = bypass
+	if t.dnatBypass != nil {
+		t.dnatBypass.serviceEvents = bypass.events
+	}
 	if err != nil && t.options.Logger != nil {
 		t.options.Logger.Warn(E.Cause(err, "read initial IPVS DNS backends; retrying on refresh"))
 	}
@@ -300,6 +310,8 @@ func (t *NativeTun) updateIPVSDNSFamily(
 	return sortedIPVSDNSDestinations(currentDestinations), nil
 }
 
+// A partially applied pair remains in Destinations so refresh can finish
+// installing it, or remove it if the backend disappears before the retry.
 func (t *NativeTun) markIPVSDNSPending(destination ipvsDNSDestination) {
 	if t.ipvsDNSPending == nil {
 		t.ipvsDNSPending = make(map[ipvsDNSDestination]bool)

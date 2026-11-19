@@ -19,9 +19,12 @@ import (
 )
 
 type serviceForwardScope struct {
-	backends []netip.Prefix
-	uplinks  []string
-	cilium   bool
+	backends        []netip.Prefix
+	uplinks         []string
+	calicoWorkloads bool
+	cilium          bool
+	queueNumber     uint16
+	calico          *calicoTopology
 }
 
 // With Cilium's MARK_MAGIC_IDENTITY the upper 16 and lower 8 bits hold
@@ -34,40 +37,88 @@ const (
 	ciliumRoutedIdentity = ciliumIdentity | ciliumRouteBit
 )
 
-func (b *autoRouteDNATBypass) syncServiceForward(next [2]serviceForwardScope) error {
-	for i, scope := range next {
-		if len(scope.backends) == 0 || len(scope.uplinks) == 0 {
-			next[i] = serviceForwardScope{}
-		}
+func (b *autoRouteDNATBypass) prepareCalicoQueue(needed bool) error {
+	if b.calicoQueue.running() {
+		return nil
 	}
-	for i, scope := range next {
-		sort.Strings(scope.uplinks)
-		sort.Slice(scope.backends, func(i, j int) bool {
-			a, b := scope.backends[i], scope.backends[j]
-			if a.Addr() == b.Addr() {
-				return a.Bits() < b.Bits()
-			}
-			return a.Addr().Less(b.Addr())
-		})
-		old := b.forwardScopes[i]
-		if slices.Equal(old.backends, scope.backends) && slices.Equal(old.uplinks, scope.uplinks) && old.cilium == scope.cilium {
-			continue
+	if b.calicoQueue != nil {
+		b.calicoQueue.Close()
+		b.calicoQueue = nil
+	}
+	if !needed {
+		return nil
+	}
+	var err error
+	b.calicoQueue, err = newCalicoServiceQueue(b)
+	return err
+}
+
+func (b *autoRouteDNATBypass) calicoClassifierReady(i int) bool {
+	scope := b.forwardScopes[i]
+	return scope.calicoWorkloads && b.calicoQueue.running() && scope.queueNumber == b.calicoQueue.number
+}
+
+func (b *autoRouteDNATBypass) serviceClassifierReady(i int, path serviceRoute) bool {
+	scope := b.forwardScopes[i]
+	if !slices.Contains(scope.backends, path.prefix) {
+		return false
+	}
+	if path.forward == ciliumReply {
+		return scope.cilium
+	}
+	return b.calicoClassifierReady(i) && (path.forward != calicoUplinkProbe || slices.Contains(scope.uplinks, path.iif))
+}
+
+func (b *autoRouteDNATBypass) closeUnusedCalicoQueue() {
+	if b.calicoQueue != nil && !b.calicoClassifierReady(0) && !b.calicoClassifierReady(1) {
+		b.calicoQueue.Close()
+		b.calicoQueue = nil
+	}
+}
+
+func (b *autoRouteDNATBypass) syncServiceForward(i int, scope serviceForwardScope) error {
+	sort.Strings(scope.uplinks)
+	sort.Slice(scope.backends, func(i, j int) bool {
+		a, b := scope.backends[i], scope.backends[j]
+		if a.Addr() == b.Addr() {
+			return a.Bits() < b.Bits()
 		}
+		return a.Addr().Less(b.Addr())
+	})
+	scope.backends = slices.Compact(scope.backends)
+	old := b.forwardScopes[i]
+	if old.queueNumber != scope.queueNumber || old.calicoWorkloads != scope.calicoWorkloads || old.cilium != scope.cilium ||
+		!slices.Equal(old.backends, scope.backends) || !slices.Equal(old.uplinks, scope.uplinks) {
 		var err error
-		switch {
-		case b.useNFTables:
+		if b.useNFTables {
 			err = b.replaceNFTServiceForward(i, scope)
-		case len(scope.backends) == 0:
-			err = b.cleanupIPTablesServiceForward([]string{b.iptablesPath, b.ip6tablesPath}[i])
-		default:
+		} else {
 			err = b.replaceIPTablesServiceForward(i, scope)
 		}
 		if err != nil {
 			return err
 		}
-		b.forwardScopes[i] = scope
 	}
+	// Keep serving the previous scope while an xtables lock delays commit.
+	// Publish the replacement only after the kernel accepted the rules.
+	if queue := b.calicoQueue; queue != nil {
+		queue.access.Lock()
+		queue.scopes[i] = scope
+		queue.access.Unlock()
+	}
+	b.forwardScopes[i] = scope
 	return nil
+}
+
+// A FIB probe runs before netfilter. Distinguish a real, as yet unmarked
+// workload packet from that probe without granting it a native-route mark.
+func (b *autoRouteDNATBypass) forwardedInputMark() uint32 {
+	mark := uint32(DefaultAutoRedirectInputMark & autoRouteDNATBypassMarkFieldMask)
+	mask := b.options.autoRouteDNATBypassMask()
+	if mark&mask == b.options.autoRouteDNATBypassMark() {
+		mark ^= mask & -mask
+	}
+	return mark
 }
 
 func (b *autoRouteDNATBypass) serviceConnmarkMask(mark uint32) uint32 {
@@ -86,6 +137,7 @@ func (b *autoRouteDNATBypass) replaceNFTServiceForward(i int, scope serviceForwa
 	table := &nftables.Table{Name: b.tableName, Family: nftables.TableFamilyINet}
 	suffix := []string{"4", "6"}[i]
 	chain := &nftables.Chain{Name: "service_forward" + suffix, Table: table, Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 3)}
+	queue := &nftables.Chain{Name: "service_queue" + suffix, Table: table}
 	set := &nftables.Set{Name: "service_backends" + suffix, Table: table, KeyType: nftables.TypeIPAddr, Interval: true}
 	family := nftables.TableFamilyIPv4
 	offset, length := uint32(16), uint32(4)
@@ -135,6 +187,32 @@ func (b *autoRouteDNATBypass) replaceNFTServiceForward(i int, scope serviceForwa
 			conn.AddRule(&nftables.Rule{Table: table, Chain: restore, Exprs: appendRouteMark(match, ciliumRouteBit, 0)})
 		}
 	}
+	// Release the policy routing discriminator before Calico's egress program
+	// performs reverse NAT. Keep the rest of the skb mark untouched.
+	if bit := b.options.autoRouteDNATDiscriminator(); bit != 0 && (scope.calicoWorkloads || b.forwardScopes[i].calicoWorkloads) {
+		restore := &nftables.Chain{Name: "service_restore_post" + suffix, Table: table, Type: nftables.ChainTypeFilter,
+			Hooknum: nftables.ChainHookPostrouting, Priority: nftables.ChainPriorityMangle}
+		if b.forwardScopes[i].calicoWorkloads {
+			conn.FlushChain(restore)
+		} else {
+			conn.AddChain(restore)
+		}
+		if !scope.calicoWorkloads {
+			conn.DelChain(restore)
+		}
+		for _, uplink := range scope.uplinks {
+			if !scope.calicoWorkloads {
+				break
+			}
+			match := []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{byte(family)}},
+				&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte("cali")},
+				&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: nftablesIfname(uplink)},
+			}
+			match = appendServiceMarkMatch(match, b.options.autoRouteDNATBypassMask(), b.options.autoRouteDNATBypassMark())
+			conn.AddRule(&nftables.Rule{Table: table, Chain: restore, Exprs: appendRouteMark(match, bit, 0)})
+		}
+	}
 	if len(b.forwardScopes[i].backends) == 0 {
 		conn.AddChain(chain)
 		if err = conn.AddSet(set, nil); err != nil {
@@ -142,6 +220,9 @@ func (b *autoRouteDNATBypass) replaceNFTServiceForward(i int, scope serviceForwa
 		}
 	} else {
 		conn.FlushChain(chain)
+		if b.forwardScopes[i].calicoWorkloads && !scope.calicoWorkloads {
+			conn.DelChain(queue)
+		}
 		if len(elems) == 0 {
 			conn.DelChain(chain)
 			conn.DelSet(set)
@@ -159,6 +240,20 @@ func (b *autoRouteDNATBypass) replaceNFTServiceForward(i int, scope serviceForwa
 		}
 		elems = elems[count:]
 	}
+	if scope.calicoWorkloads {
+		if b.forwardScopes[i].calicoWorkloads {
+			conn.FlushChain(queue)
+		} else {
+			conn.AddChain(queue)
+		}
+		// A queued packet resumes at the next netfilter hook on accept or
+		// bypass. Distinguish unmarked packets from FIB probes before queueing.
+		conn.AddRule(&nftables.Rule{Table: table, Chain: queue, Exprs: appendRouteMark(
+			appendServiceMarkMatch(nil, ^uint32(0), 0), ^uint32(0), b.forwardedInputMark())})
+		conn.AddRule(&nftables.Rule{Table: table, Chain: queue, Exprs: []expr.Any{
+			&expr.Queue{Num: scope.queueNumber, Total: 1, Flag: expr.QueueFlagBypass},
+		}})
+	}
 	conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: []expr.Any{
 		&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
 		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{byte(family)}},
@@ -167,6 +262,24 @@ func (b *autoRouteDNATBypass) replaceNFTServiceForward(i int, scope serviceForwa
 	mask := b.options.autoRouteDNATBypassMask()
 	for _, proto := range []byte{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
 		transport := []expr.Any{&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}}}
+		if scope.calicoWorkloads {
+			match := append(slices.Clone(transport),
+				&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte("cali")},
+				&expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset - length, Len: length},
+				&expr.Lookup{SourceRegister: 1, SetID: set.ID, SetName: set.Name})
+			if proto == unix.IPPROTO_TCP {
+				invalid := append(slices.Clone(match),
+					&expr.Ct{Key: expr.CtKeySTATE, Register: 1},
+					&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: binaryutil.NativeEndian.PutUint32(expr.CtStateBitINVALID | expr.CtStateBitUNTRACKED), Xor: make([]byte, 4)},
+					&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(0)})
+				invalid = appendServiceMarkMatch(invalid, mask, 0)
+				conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: append(invalid, &expr.Verdict{Kind: expr.VerdictJump, Chain: queue.Name})})
+			}
+			match = append(match,
+				&expr.Ct{Key: expr.CtKeyMARK, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(0)})
+			match = appendServiceMarkMatch(match, mask, 0)
+			conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: append(match, &expr.Verdict{Kind: expr.VerdictJump, Chain: queue.Name})})
+		}
 		for _, up := range scope.uplinks {
 			unclassified := []expr.Any{&expr.Ct{Key: expr.CtKeyMARK, Register: 1}}
 			if scope.cilium {
@@ -187,16 +300,24 @@ func (b *autoRouteDNATBypass) replaceNFTServiceForward(i int, scope serviceForwa
 		}
 		for direction := byte(0); direction <= 1; direction++ {
 			backendOffset := offset
+			iifOp, iif := expr.CmpOpNeq, nftablesIfname(b.options.Name)
 			if direction == 1 {
 				backendOffset -= length
+				if scope.calicoWorkloads && !scope.cilium {
+					iifOp, iif = expr.CmpOpEq, []byte("cali")
+				}
 			}
+			// Direct BPF delivery can make conntrack see the workload's reply
+			// first. Use the packet addresses after validating the uplink.
 			native := append(transport,
-				&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1}, &expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: nftablesIfname(b.options.Name)},
+				&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1}, &expr.Cmp{Op: iifOp, Register: 1, Data: iif},
 				&expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: backendOffset, Len: length},
 				&expr.Lookup{SourceRegister: 1, SetID: set.ID, SetName: set.Name},
 			)
 			native = append(native, nativeConnmarkMatch...)
-			native = append(native, &expr.Ct{Key: expr.CtKeyDIRECTION, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{direction}})
+			if !scope.calicoWorkloads || scope.cilium {
+				native = append(native, &expr.Ct{Key: expr.CtKeyDIRECTION, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{direction}})
+			}
 			if direction == 1 && scope.cilium {
 				match := appendServiceMarkMatch(slices.Clone(native), ciliumMarkMask, ciliumIdentity)
 				marked := appendRouteMark(match, ciliumRouteBit, ciliumRouteBit)
@@ -204,6 +325,22 @@ func (b *autoRouteDNATBypass) replaceNFTServiceForward(i int, scope serviceForwa
 			}
 			conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: appendRouteMark(appendServiceMarkMatch(native, mask, 0), mask, b.options.autoRouteDNATBypassMark())})
 		}
+	}
+	if scope.calicoWorkloads {
+		markUnmarkedInput := func(iface []byte, addrOffset uint32) {
+			conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: iface},
+				&expr.Meta{Key: expr.MetaKeyMARK, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(0)},
+				&expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: addrOffset, Len: length},
+				&expr.Lookup{SourceRegister: 1, SetID: set.ID, SetName: set.Name},
+				&expr.Immediate{Register: 1, Data: binaryutil.NativeEndian.PutUint32(b.forwardedInputMark())},
+				&expr.Meta{Key: expr.MetaKeyMARK, Register: 1, SourceRegister: true},
+			}})
+		}
+		for _, up := range scope.uplinks {
+			markUnmarkedInput(nftablesIfname(up), offset)
+		}
+		markUnmarkedInput([]byte("cali"), offset-length)
 	}
 	return conn.Flush()
 }
@@ -219,12 +356,25 @@ func appendServiceMarkMatch(expressions []expr.Any, mask, mark uint32) []expr.An
 func (b *autoRouteDNATBypass) replaceIPTablesServiceForward(i int, scope serviceForwardScope) error {
 	path := []string{b.iptablesPath, b.ip6tablesPath}[i]
 	chain := b.chainName + "-FWD"
+	queue := b.chainName + "-QUEUE"
 	nativeMark := b.options.autoRouteOutputMark()
 	ctmark := fmt.Sprintf("%#x/%#x", nativeMark, b.serviceConnmarkMask(nativeMark))
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "*mangle\n:%s - [0:0]\n-F %s\n", chain, chain)
-	if len(b.forwardScopes[i].backends) == 0 {
-		fmt.Fprintf(&buf, "-I PREROUTING -j %s\n", chain)
+	buf.WriteString("*mangle\n")
+	if len(scope.backends) == 0 {
+		fmt.Fprintf(&buf, "-D PREROUTING -j %s\n-F %s\n-X %s\n", chain, chain, chain)
+	} else {
+		fmt.Fprintf(&buf, ":%s - [0:0]\n-F %s\n", chain, chain)
+		if len(b.forwardScopes[i].backends) == 0 {
+			fmt.Fprintf(&buf, "-I PREROUTING -j %s\n", chain)
+		}
+	}
+	if scope.calicoWorkloads {
+		fmt.Fprintf(&buf, ":%s - [0:0]\n-F %s\n", queue, queue)
+		fmt.Fprintf(&buf, "-A %s -m mark --mark 0 -j MARK --set-mark %#x\n", queue, b.forwardedInputMark())
+		fmt.Fprintf(&buf, "-A %s -j NFQUEUE --queue-num %d --queue-bypass\n", queue, scope.queueNumber)
+	} else if b.forwardScopes[i].calicoWorkloads {
+		fmt.Fprintf(&buf, "-F %s\n-X %s\n", queue, queue)
 	}
 	for _, hook := range []string{"INPUT", "FORWARD"} {
 		restore := b.chainName + "-" + hook
@@ -239,8 +389,29 @@ func (b *autoRouteDNATBypass) replaceIPTablesServiceForward(i int, scope service
 			fmt.Fprintf(&buf, "-D %s -j %s\n-F %s\n-X %s\n", hook, restore, restore, restore)
 		}
 	}
+	if bit := b.options.autoRouteDNATDiscriminator(); bit != 0 {
+		restore := b.chainName + "-POST"
+		if scope.calicoWorkloads {
+			fmt.Fprintf(&buf, ":%s - [0:0]\n-F %s\n", restore, restore)
+			if !b.forwardScopes[i].calicoWorkloads {
+				fmt.Fprintf(&buf, "-I POSTROUTING -j %s\n", restore)
+			}
+			for _, uplink := range scope.uplinks {
+				fmt.Fprintf(&buf, "-A %s -i cali+ -o %s -m mark --mark %#x/%#x -j MARK --set-xmark 0/%#x\n",
+					restore, strconv.Quote(uplink), b.options.autoRouteDNATBypassMark(), b.options.autoRouteDNATBypassMask(), bit)
+			}
+		} else if b.forwardScopes[i].calicoWorkloads {
+			fmt.Fprintf(&buf, "-D POSTROUTING -j %s\n-F %s\n-X %s\n", restore, restore, restore)
+		}
+	}
 	for _, addr := range scope.backends {
 		for _, proto := range []string{"tcp", "udp"} {
+			if scope.calicoWorkloads {
+				if proto == "tcp" {
+					fmt.Fprintf(&buf, "-A %s -i cali+ -s %s -p tcp -m conntrack --ctstate INVALID,UNTRACKED -m mark --mark 0/%#x -j %s\n", chain, addr, b.options.autoRouteDNATBypassMask(), queue)
+				}
+				fmt.Fprintf(&buf, "-A %s -i cali+ -s %s -p %s -m connmark --mark 0 -m mark --mark 0/%#x -j %s\n", chain, addr, proto, b.options.autoRouteDNATBypassMask(), queue)
+			}
 			for _, up := range scope.uplinks {
 				unclassified := "0"
 				if scope.cilium {
@@ -256,12 +427,24 @@ func (b *autoRouteDNATBypass) replaceIPTablesServiceForward(i int, scope service
 				fmt.Fprintf(&buf, "-A %s ! -i %s -s %s -p %s -m conntrack --ctdir REPLY -m connmark --mark %s -m mark --mark %#x/%#x -j RETURN\n", chain, strconv.Quote(b.options.Name), addr, proto, ctmark, ciliumRoutedIdentity, ciliumMarkMask)
 			}
 			nonTun := "! -i " + strconv.Quote(b.options.Name)
-			matches := []string{nonTun + " -d " + addr.String(), nonTun + " -s " + addr.String()}
-			matches[0] += " -m conntrack --ctdir ORIGINAL"
-			matches[1] += " -m conntrack --ctdir REPLY"
+			workload := nonTun
+			if scope.calicoWorkloads && !scope.cilium {
+				workload = "-i cali+"
+			}
+			matches := []string{nonTun + " -d " + addr.String(), workload + " -s " + addr.String()}
+			if !scope.calicoWorkloads || scope.cilium {
+				matches[0] += " -m conntrack --ctdir ORIGINAL"
+				matches[1] += " -m conntrack --ctdir REPLY"
+			}
 			for _, match := range matches {
 				fmt.Fprintf(&buf, "-A %s -p %s %s -m connmark --mark %s -m mark --mark 0/%#x -j MARK --set-xmark %#x/%#x\n", chain, proto, match, ctmark, b.options.autoRouteDNATBypassMask(), b.options.autoRouteDNATBypassMark(), b.options.autoRouteDNATBypassMask())
 			}
+		}
+		if scope.calicoWorkloads {
+			for _, up := range scope.uplinks {
+				fmt.Fprintf(&buf, "-A %s -i %s -d %s -m mark --mark 0 -j MARK --set-mark %#x\n", chain, strconv.Quote(up), addr, b.forwardedInputMark())
+			}
+			fmt.Fprintf(&buf, "-A %s -i cali+ -s %s -m mark --mark 0 -j MARK --set-mark %#x\n", chain, addr, b.forwardedInputMark())
 		}
 	}
 	buf.WriteString("COMMIT\n")
