@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 
 	"github.com/metacubex/nftables"
 	"github.com/metacubex/sing/common"
@@ -26,6 +27,9 @@ type autoRedirect struct {
 	tableName              string
 	networkMonitor         NetworkUpdateMonitor
 	networkListener        *list.Element[NetworkUpdateCallback]
+	legacyDNSAccess        sync.Mutex
+	legacyDNSActive        bool
+	legacyDNSRules         [2][]string
 	interfaceFinder        control.InterfaceFinder
 	localAddresses         []netip.Prefix
 	customRedirectPortFunc func() int
@@ -139,6 +143,16 @@ func (r *autoRedirect) Start() error {
 	} else {
 		r.cleanupIPTables()
 		err = r.setupIPTables()
+		if err != nil {
+			r.cleanupIPTables()
+			return E.Errors(err, common.Close(common.PtrOrNil(r.redirectServer)))
+		}
+		if runtime.GOOS != "android" && r.tunOptions.AutoRoute && r.networkMonitor != nil &&
+			r.interfaceFinder != nil && r.tunOptions.DNSModeOrDefault() == DNSModeHijack {
+			r.legacyDNSActive = true
+			r.networkListener = r.networkMonitor.RegisterCallback(r.refreshIPTablesLocalDNS)
+			r.refreshIPTablesLocalDNS()
+		}
 	}
 	return err
 }
@@ -147,7 +161,14 @@ func (r *autoRedirect) Close() error {
 	if r.useNFTables {
 		r.cleanupNFTables()
 	} else {
+		if r.networkListener != nil {
+			r.networkMonitor.UnregisterCallback(r.networkListener)
+			r.networkListener = nil
+		}
+		r.legacyDNSAccess.Lock()
+		r.legacyDNSActive = false
 		r.cleanupIPTables()
+		r.legacyDNSAccess.Unlock()
 	}
 	return common.Close(
 		common.PtrOrNil(r.redirectServer),

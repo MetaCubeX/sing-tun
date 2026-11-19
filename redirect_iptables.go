@@ -13,6 +13,14 @@ import (
 )
 
 func (r *autoRedirect) setupIPTables() error {
+	if r.logger != nil && r.tunOptions.DNSModeOrDefault() == DNSModeHijack {
+		for _, rule := range r.tunOptions.DNSHijack {
+			if rule.Network == "tcp" {
+				r.logger.Warn("iptables auto-redirect cannot intercept TCP DNS; queries entering TUN are still handled")
+				break
+			}
+		}
+	}
 	if r.enableIPv4 {
 		err := r.setupIPTablesForFamily(r.iptablesPath)
 		if err != nil {
@@ -95,6 +103,13 @@ func (r *autoRedirect) setupIPTablesForFamily(iptablesPath string) error {
 	if err != nil {
 		return err
 	}
+	if r.tunOptions.AutoRoute {
+		err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing,
+			"-m conntrack --ctstate DNAT -j RETURN")
+		if err != nil {
+			return err
+		}
+	}
 	var (
 		routeAddress        []netip.Prefix
 		routeExcludeAddress []netip.Prefix
@@ -131,15 +146,41 @@ func (r *autoRedirect) setupIPTablesForFamily(iptablesPath string) error {
 	// Forwarded packets have no socket owner. UID policy is applied by the
 	// routing rules before locally generated traffic reaches the OUTPUT redirect.
 
-	if r.tunOptions.DNSModeOrDefault() == DNSModeHijack {
-		if err = r.iptablesCreateDNSHijackRules(iptablesPath, tableNamePreRouteing, routeAddress); err != nil {
+	if r.tunOptions.AutoRoute {
+		if r.tunOptions.DNSModeOrDefault() == DNSModeHijack && r.interfaceFinder != nil {
+			chain := r.tableName + "-local-dns"
+			if err = r.runShell(iptablesPath, "-t nat -N", chain); err != nil {
+				return err
+			}
+			if err = r.syncIPTablesLocalDNS(iptablesPath, routeAddress); err != nil {
+				return err
+			}
+			if err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing, "-j", chain); err != nil {
+				return err
+			}
+		}
+		err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing, "-m addrtype --dst-type LOCAL -j RETURN")
+		if err != nil {
 			return err
 		}
 	}
+	if r.tunOptions.DNSModeOrDefault() == DNSModeHijack {
+		rules, err := r.iptablesDNSHijackRules(iptablesPath, routeAddress, nil)
+		if err != nil {
+			return err
+		}
+		for _, rule := range rules {
+			if err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing, rule); err != nil {
+				return err
+			}
+		}
+	}
 
-	err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing, "-m addrtype --dst-type LOCAL -j RETURN")
-	if err != nil {
-		return err
+	if !r.tunOptions.AutoRoute {
+		err = r.runShell(iptablesPath, "-t nat -A", tableNamePreRouteing, "-m addrtype --dst-type LOCAL -j RETURN")
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(routeAddress) > 0 {
@@ -166,7 +207,11 @@ func (r *autoRedirect) setupIPTablesForFamily(iptablesPath string) error {
 			return err
 		}
 	}
-	err = r.runShell(iptablesPath, "-t nat -I PREROUTING -j", tableNamePreRouteing)
+	preRoutingOperation := "-I"
+	if r.tunOptions.AutoRoute {
+		preRoutingOperation = "-A"
+	}
+	err = r.runShell(iptablesPath, "-t nat", preRoutingOperation, "PREROUTING -j", tableNamePreRouteing)
 	if err != nil {
 		return err
 	}
@@ -174,6 +219,7 @@ func (r *autoRedirect) setupIPTablesForFamily(iptablesPath string) error {
 }
 
 func (r *autoRedirect) cleanupIPTables() {
+	r.legacyDNSRules = [2][]string{}
 	if r.enableIPv4 {
 		r.cleanupIPTablesForFamily(r.iptablesPath)
 	}
@@ -206,6 +252,8 @@ func (r *autoRedirect) cleanupIPTablesForFamily(iptablesPath string) {
 	_ = r.runShell(iptablesPath, "-t nat -D PREROUTING -j", tableNamePreRouteing)
 	_ = r.runShell(iptablesPath, "-t nat -F", tableNamePreRouteing)
 	_ = r.runShell(iptablesPath, "-t nat -X", tableNamePreRouteing)
+	_ = r.runShell(iptablesPath, "-t nat -F", r.tableName+"-local-dns")
+	_ = r.runShell(iptablesPath, "-t nat -X", r.tableName+"-local-dns")
 }
 
 func (r *autoRedirect) runShell(commands ...any) error {
