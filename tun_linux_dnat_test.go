@@ -4,6 +4,7 @@ package tun
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -114,7 +115,7 @@ func TestEnableAutoRouteDNATBypassDegradesOnUnavailableBackend(t *testing.T) {
 func TestDNATMarkExpressions(t *testing.T) {
 	options := &Options{AutoRedirectOutputMark: DefaultAutoRedirectOutputMark}
 	expressions := dnatMarkExpressions(options)
-	require.Len(t, expressions, 9)
+	require.Len(t, expressions, 12)
 
 	status, loaded := expressions[0].(*expr.Ct)
 	require.True(t, loaded)
@@ -122,17 +123,17 @@ func TestDNATMarkExpressions(t *testing.T) {
 
 	require.Equal(t, expr.CtKeyDIRECTION, expressions[3].(*expr.Ct).Key)
 	require.Equal(t, []byte{1}, expressions[4].(*expr.Cmp).Data)
-	mark, loaded := expressions[5].(*expr.Meta)
+	mark, loaded := expressions[8].(*expr.Meta)
 	require.True(t, loaded)
 	require.Equal(t, expr.MetaKeyMARK, mark.Key)
 	require.False(t, mark.SourceRegister)
 
-	mask, loaded := expressions[6].(*expr.Bitwise)
+	mask, loaded := expressions[9].(*expr.Bitwise)
 	require.True(t, loaded)
 	require.Equal(t, binaryutil.NativeEndian.PutUint32(^uint32(0x2FFF)), mask.Mask)
 	require.Equal(t, binaryutil.NativeEndian.PutUint32(0x2024), mask.Xor)
 
-	meta, loaded := expressions[7].(*expr.Meta)
+	meta, loaded := expressions[10].(*expr.Meta)
 	require.True(t, loaded)
 	require.Equal(t, expr.MetaKeyMARK, meta.Key)
 	require.True(t, meta.SourceRegister)
@@ -144,11 +145,11 @@ func TestDNATMarkExpressionsExcludeAutoRedirectInputMark(t *testing.T) {
 		AutoRedirectInputMark: DefaultAutoRedirectInputMark,
 	}
 	expressions := dnatMarkExpressions(options)
-	require.Len(t, expressions, 11)
-	mark, loaded := expressions[5].(*expr.Meta)
+	require.Len(t, expressions, 14)
+	mark, loaded := expressions[8].(*expr.Meta)
 	require.True(t, loaded)
 	require.Equal(t, expr.MetaKeyMARK, mark.Key)
-	compare, loaded := expressions[6].(*expr.Cmp)
+	compare, loaded := expressions[9].(*expr.Cmp)
 	require.True(t, loaded)
 	require.Equal(t, expr.CmpOpNeq, compare.Op)
 }
@@ -222,6 +223,47 @@ func TestAutoRedirectDisablesNFTables(t *testing.T) {
 	require.False(t, redirect.(*autoRedirect).useNFTables)
 }
 
+func TestSrcValidMarkLeaseRestoresOnlyAfterLastOwner(t *testing.T) {
+	conf := createIPv4Conf(t, "1", "0", "0")
+	dir := t.TempDir() + "/state"
+	path := conf + "/eth0/src_valid_mark"
+	first, second := srcValidMarkOwner{stateDir: dir}, srcValidMarkOwner{stateDir: dir}
+	t.Cleanup(func() { require.NoError(t, first.close()); require.NoError(t, second.close()) })
+	read := func() string {
+		t.Helper()
+		value, err := os.ReadFile(path)
+		require.NoError(t, err)
+		return string(value)
+	}
+	require.NoError(t, first.syncForRPF(conf, nil))
+	require.NoError(t, second.syncForRPF(conf, nil))
+	require.Equal(t, "1", read())
+	require.NoError(t, first.close())
+	require.Equal(t, "1", read())
+	require.NoError(t, second.close())
+	require.Equal(t, "0", read())
+}
+
+func TestSrcValidMarkLeaseRespectsExternalValue(t *testing.T) {
+	for _, initial := range []string{"0", "1"} {
+		t.Run(initial, func(t *testing.T) {
+			conf := createIPv4Conf(t, "1", "0", "0")
+			path := conf + "/eth0/src_valid_mark"
+			require.NoError(t, os.WriteFile(path, []byte(initial), 0600))
+			owner := srcValidMarkOwner{stateDir: t.TempDir() + "/state"}
+			t.Cleanup(func() { require.NoError(t, owner.close()) })
+			require.NoError(t, owner.syncForRPF(conf, nil))
+			if initial == "0" {
+				require.NoError(t, os.WriteFile(path, []byte("0"), 0600))
+			}
+			require.NoError(t, owner.close())
+			value, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, initial, string(value))
+		})
+	}
+}
+
 func createIPv4Conf(t *testing.T, allRPFilter string, defaultRPFilter string, interfaceRPFilter string) string {
 	t.Helper()
 	confPath := t.TempDir()
@@ -237,6 +279,32 @@ func createIPv4Conf(t *testing.T, allRPFilter string, defaultRPFilter string, in
 	}
 	require.NoError(t, os.WriteFile(confPath+"/all/src_valid_mark", []byte("0"), 0o600))
 	return confPath
+}
+
+func TestSrcValidMarkFollowsEffectiveRPF(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		all       string
+		defaultIf string
+		eth0      string
+		expected  bool
+	}{
+		"interface strict": {all: "0", defaultIf: "0", eth0: "1", expected: true},
+		"default strict":   {all: "0", defaultIf: "1", eth0: "0", expected: false},
+		"all strict":       {all: "1", defaultIf: "0", eth0: "0", expected: true},
+		"all loose":        {all: "2", defaultIf: "0", eth0: "0", expected: false},
+		"interfaces loose": {all: "1", defaultIf: "2", eth0: "2", expected: false},
+		"disabled":         {all: "0", defaultIf: "0", eth0: "0", expected: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			confPath := createIPv4Conf(t, testCase.all, testCase.defaultIf, testCase.eth0)
+			owner := srcValidMarkOwner{stateDir: t.TempDir() + "/state"}
+			t.Cleanup(func() { require.NoError(t, owner.close()) })
+			require.NoError(t, owner.syncForRPF(confPath, nil))
+			value, err := os.ReadFile(confPath + "/eth0/src_valid_mark")
+			require.NoError(t, err)
+			require.Equal(t, testCase.expected, string(value) == "1")
+		})
+	}
 }
 
 func TestAutoRouteDNATBypassNFTables(t *testing.T) {
@@ -318,13 +386,11 @@ func TestDNSChainFailureKeepsPublishedPortBypass(t *testing.T) {
 		Hooknum: nftables.ChainHookForward, Priority: nftables.ChainPriorityFilter})
 	require.NoError(t, nft.Flush())
 	b.startDNS()
-	core, err := nft.ListTableOfFamily(b.tableName, nftables.TableFamilyINet)
-	require.NoError(t, err)
 	require.NotEmpty(t, recorder.warnings)
 	require.Nil(t, b.dnsRules[0], "failed DNS setup must remove its policy rule")
 	checkDNSPolicyCount(t, 19000, 0)
-	// Deliver a translated packet through loopback and observe the original
-	// DNAT mark counter while the DNS extension is unavailable.
+	// Complete a translated exchange through loopback and verify the base
+	// DNAT reply rule still works while the DNS extension is unavailable.
 	require.NoError(t, exec.Command("ip", "link", "set", "lo", "up").Run())
 	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
@@ -342,14 +408,38 @@ func TestDNSChainFailureKeepsPublishedPortBypass(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, listener.SetReadDeadline(time.Now().Add(2*time.Second)))
 	buf := make([]byte, 64)
-	n, _, err := listener.ReadFromUDP(buf)
+	n, peer, err := listener.ReadFromUDP(buf)
 	require.NoError(t, err)
 	require.Equal(t, "published", string(buf[:n]))
-	rules, err := nft.GetRules(core, &nftables.Chain{Name: "local_destination", Table: core})
+	_, err = listener.WriteToUDP([]byte("published-reply"), peer)
 	require.NoError(t, err)
-	require.NotEmpty(t, rules)
-	counter := rules[0].Exprs[len(rules[0].Exprs)-1].(*expr.Counter)
-	require.Positive(t, counter.Packets)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(2*time.Second)))
+	n, err = client.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "published-reply", string(buf[:n]))
+	out, err = exec.Command("nft", "-j", "list", "chain", "inet", b.tableName, "prerouting").CombinedOutput()
+	require.NoError(t, err, string(out))
+	var counters struct {
+		NFTables []struct {
+			Rule struct {
+				Expr []struct{ Counter *expr.Counter }
+			}
+		}
+	}
+	require.NoError(t, json.Unmarshal(out, &counters))
+	var markedReply uint64
+	for _, item := range counters.NFTables {
+		if len(item.Rule.Expr) == 0 {
+			continue
+		}
+		for _, expression := range item.Rule.Expr {
+			if expression.Counter != nil {
+				markedReply = expression.Counter.Packets
+			}
+		}
+		break
+	}
+	require.Positive(t, markedReply)
 	require.NoError(t, deleteRouteNFTTable(nftables.TableFamilyIPv4, table.Name))
 	b.startDNS()
 	require.NotNil(t, b.dnsRules[0], "setup must succeed after the conflicting chain is gone")

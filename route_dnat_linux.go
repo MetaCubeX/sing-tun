@@ -46,6 +46,7 @@ type autoRouteDNATBypass struct {
 	ip6tablesPath string
 	ipvsOutput    [2][]ipvsDNSDestination
 	dnsRules      [2][]*netlink.Rule
+	forwardScopes [2]serviceForwardScope
 }
 
 func (t *NativeTun) enableAutoRouteDNATBypass(
@@ -196,6 +197,7 @@ func (b *autoRouteDNATBypass) cleanupBase() error {
 	}
 	if err == nil {
 		b.ipvsOutput = [2][]ipvsDNSDestination{}
+		b.forwardScopes = [2]serviceForwardScope{}
 		b.localDNAT = [2][]netip.Prefix{}
 	}
 	return err
@@ -387,7 +389,14 @@ func dnatMarkExpressions(options *Options) []expr.Any {
 	return nativeDNATMark(expressions, options)
 }
 
+const ciliumIdentityMask = ciliumMarkMask &^ ciliumRouteBit
+
 func nativeDNATMark(expressions []expr.Any, options *Options) []expr.Any {
+	expressions = append(expressions,
+		&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: binaryutil.NativeEndian.PutUint32(ciliumIdentityMask), Xor: make([]byte, 4)},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(ciliumIdentity)},
+	)
 	if options.AutoRedirectMarkMode {
 		expressions = append(expressions,
 			&expr.Meta{
@@ -402,14 +411,6 @@ func nativeDNATMark(expressions []expr.Any, options *Options) []expr.Any {
 		)
 	}
 	return appendRouteMark(expressions, options.autoRouteDNATBypassMask(), options.autoRouteDNATBypassMark())
-}
-
-func appendServiceMarkMatch(expressions []expr.Any, mask, mark uint32) []expr.Any {
-	return append(expressions,
-		&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
-		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: binaryutil.NativeEndian.PutUint32(mask), Xor: make([]byte, 4)},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(mark)},
-	)
 }
 
 func appendRouteMark(expressions []expr.Any, clearMask, xorMask uint32) []expr.Any {
@@ -436,6 +437,7 @@ func appendRouteMark(expressions []expr.Any, clearMask, xorMask uint32) []expr.A
 
 func (b *autoRouteDNATBypass) setupIPTables() error {
 	markMask := b.options.autoRouteDNATBypassMask()
+	identity := fmt.Sprintf("%#x/%#x", ciliumIdentity, ciliumIdentityMask)
 	for _, path := range []string{b.iptablesPath, b.ip6tablesPath} {
 		if path == "" {
 			continue
@@ -463,7 +465,8 @@ func (b *autoRouteDNATBypass) setupIPTables() error {
 			return err
 		}
 		reply := []string{path, "-t", "mangle", "-A", b.chainName,
-			"-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "REPLY"}
+			"-m", "conntrack", "--ctstate", "DNAT", "--ctdir", "REPLY",
+			"-m", "mark", "!", "--mark", identity}
 		if b.options.AutoRedirectMarkMode {
 			reply = append(reply, "-m", "mark", "!", "--mark", fmt.Sprintf("%#x", b.options.AutoRedirectInputMark))
 		}
@@ -522,7 +525,11 @@ func (b *autoRouteDNATBypass) cleanupIPTables() error {
 
 func (b *autoRouteDNATBypass) cleanupIPTablesPath(path string) error {
 	return errors.Join(cleanupIPTablesChain(path, "mangle", "PREROUTING", b.chainName),
-		cleanupIPTablesChain(path, "mangle", "OUTPUT", b.ipvsOutputChain()))
+		cleanupIPTablesChain(path, "mangle", "OUTPUT", b.ipvsOutputChain()), b.cleanupIPTablesServiceForward(path))
+}
+
+func (b *autoRouteDNATBypass) cleanupIPTablesServiceForward(path string) error {
+	return errors.Join(cleanupIPTablesChain(path, "mangle", "PREROUTING", b.chainName+"-FWD"), cleanupIPTablesChain(path, "mangle", "INPUT", b.chainName+"-INPUT"), cleanupIPTablesChain(path, "mangle", "FORWARD", b.chainName+"-FORWARD"))
 }
 
 func cleanupIPTablesChain(path, table, hook, chain string) error {

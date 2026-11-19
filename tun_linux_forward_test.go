@@ -4,6 +4,7 @@ package tun
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -53,6 +54,127 @@ func TestAutoRouteNetlinkDescriptorsArePrivate(t *testing.T) {
 			require.NotContains(t, string(child), link, "child retained the owner's netlink socket")
 		}()
 	}
+}
+
+func TestAutoRoutePreservesForwardedServiceReply(t *testing.T) {
+	if os.Getenv("SING_TUN_ECHO_PEER") == "1" {
+		sock, err := net.ListenPacket("udp4", "10.85.1.27:18888")
+		require.NoError(t, err)
+		defer sock.Close()
+		buf := make([]byte, 128)
+		for {
+			n, peer, err := sock.ReadFrom(buf)
+			require.NoError(t, err)
+			_, err = sock.WriteTo(buf[:n], peer)
+			require.NoError(t, err)
+		}
+	}
+	if os.Getenv("SING_TUN_INTEGRATION") != "1" {
+		t.Skip("requires a private Linux network namespace, iproute2 and socat")
+	}
+	t.Run("cilium_host", func(t *testing.T) { checkForwardedService(t, "cilium_host", 0) })
+	t.Run("cilium_host_high_output_mark", func(t *testing.T) { checkForwardedService(t, "cilium_host", 0x10000) })
+}
+
+func checkForwardedService(t *testing.T, backend string, outputMark uint32) {
+	t.Helper()
+	gateways := []string{"192.0.2.1/24", "198.51.100.1/24"}
+	peers := []string{"192.0.2.2/24", "198.51.100.2/24"}
+	names := []string{fmt.Sprintf("st-client-%d", os.Getpid()), fmt.Sprintf("st-pod-%d", os.Getpid())}
+	for i, ns := range names {
+		ns := ns
+		dev := []string{"edge0", backend}[i]
+		runTestIP(t, "netns", "add", ns)
+		t.Cleanup(func() { _ = exec.Command("ip", "netns", "del", ns).Run() })
+		runTestIP(t, "link", "add", dev, "type", "veth", "peer", "name", "peer0", "netns", ns)
+		t.Cleanup(func() { require.NoError(t, exec.Command("ip", "link", "del", dev).Run()) })
+		runTestIP(t, "addr", "add", gateways[i], "dev", dev)
+		runTestIP(t, "link", "set", dev, "up")
+		runTestIP(t, "-n", ns, "addr", "add", peers[i], "dev", "peer0")
+		runTestIP(t, "-n", ns, "link", "set", "peer0", "up")
+		runTestIP(t, "-n", ns, "link", "set", "lo", "up")
+		runTestIP(t, "-n", ns, "route", "add", "default", "via", netip.MustParsePrefix(gateways[i]).Addr().String())
+	}
+	runTestIP(t, "-n", names[0], "addr", "add", "203.0.113.7/32", "dev", "lo")
+	runTestIP(t, "route", "add", "default", "via", "192.0.2.2")
+	runTestIP(t, "-n", names[1], "address", "add", "10.85.1.27/32", "dev", "peer0")
+	runTestIP(t, "route", "add", "10.85.1.0/24", "via", "198.51.100.2", "dev", backend)
+	require.NoError(t, os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0))
+	require.NoError(t, os.WriteFile("/proc/sys/net/ipv4/conf/all/rp_filter", []byte("1"), 0))
+	server := exec.Command("ip", "netns", "exec", names[1], os.Args[0], "-test.run=^TestAutoRoutePreservesForwardedServiceReply$")
+	server.Env = append(os.Environ(), "SING_TUN_ECHO_PEER=1")
+	require.NoError(t, server.Start())
+	t.Cleanup(func() { _ = server.Process.Kill(); _ = server.Wait() })
+	require.Eventually(t, func() bool {
+		b, _ := exec.Command("ip", "netns", "exec", names[1], "ss", "-lun").Output()
+		return strings.Contains(string(b), ":18888 ")
+	}, 3*time.Second, 20*time.Millisecond)
+	// Include a nonzero cluster ID. Both parts of the Cilium security
+	// identity must still be available to forwarding policy after routing.
+	cmd := exec.Command("nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(
+		"table inet service_identity_test {\n" +
+			"chain ingress { type filter hook prerouting priority raw; iifname \"cilium_host\" ip saddr 10.85.1.27 meta mark set 0xbf2a0f5a; }\n" +
+			"chain verify_forwarding { type filter hook forward priority filter; ip daddr 10.85.1.27 udp dport 18888 ct mark != 0 ct mark set ct mark | 0x40000000; ip saddr 10.85.1.27 udp sport 18888 meta mark != 0xbf2a0f5a drop; }\n}\n")
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(output))
+	t.Cleanup(func() {
+		require.NoError(t, exec.Command("nft", "delete", "table", "inet", "service_identity_test").Run())
+	})
+	echo := func(payload string) string {
+		cmd := exec.Command("ip", "netns", "exec", names[0], "socat", "-t", "1", "-T", "2", "-", "UDP4:10.85.1.27:18888,bind=203.0.113.7")
+		cmd.Stdin = strings.NewReader(payload)
+		b, err := cmd.CombinedOutput()
+		require.NoError(t, err, string(b))
+		return string(b)
+	}
+	require.Equal(t, "before", echo("before"))
+	n := startTestAutoRoute(t, outputMark)
+	require.NotNil(t, n.dnatBypass)
+	listing, err := exec.Command("nft", "list", "table", "inet", n.dnatBypass.tableName).CombinedOutput()
+	require.NoError(t, err, string(listing))
+	checkTraffic := func() {
+		require.Equal(t, "after", echo("after"))
+		ct, err := exec.Command("conntrack", "-L", "-p", "udp", "--orig-src", "203.0.113.7", "--orig-dst", "10.85.1.27", "--dport", "18888").CombinedOutput()
+		require.NoError(t, err, string(ct))
+		require.Contains(t, string(ct), fmt.Sprintf("mark=%d", n.options.autoRouteOutputMark()|0x40000000))
+		outbound := exec.Command("ip", "netns", "exec", names[1], "socat", "-u", "-", "UDP4:203.0.113.7:18889,bind=10.85.1.27")
+		outbound.Stdin = strings.NewReader("new-outbound")
+		require.NoError(t, outbound.Run())
+		fds := []unix.PollFd{{Fd: int32(n.tunFd), Events: unix.POLLIN}}
+		buf := make([]byte, 1500)
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+			count, err := unix.Poll(fds, int(time.Until(deadline).Milliseconds()))
+			require.NoError(t, err)
+			if count == 0 {
+				break
+			}
+			size, err := n.Read(buf)
+			require.NoError(t, err)
+			if size >= 28 && buf[0] == 0x45 && buf[9] == unix.IPPROTO_UDP && string(buf[28:size]) == "new-outbound" {
+				return
+			}
+		}
+		t.Fatal("new backend datagram did not arrive at the TUN")
+	}
+	checkTraffic()
+	// Exercise the kernel's legacy netfilter backend in the same topology.
+	func() {
+		n.routeAccess.Lock()
+		defer n.routeAccess.Unlock()
+		b := n.dnatBypass
+		require.NotNil(t, b)
+		require.NoError(t, b.Close())
+		b.useNFTables = false
+		path, err := exec.LookPath("iptables-legacy")
+		require.NoError(t, err)
+		b.iptablesPath = path
+		b.ip6tablesPath, err = exec.LookPath("ip6tables-legacy")
+		require.NoError(t, err)
+		require.NoError(t, b.Start())
+		require.NoError(t, n.refreshServiceRoutes())
+	}()
+	checkTraffic()
 }
 
 func TestAutoRoutePreservesServiceRouterDNS(t *testing.T) {
