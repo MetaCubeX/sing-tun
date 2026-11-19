@@ -414,16 +414,15 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	if err != nil {
 		return E.Errors(E.Cause(err, "cleanup rules"), t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
-	err = t.setRules()
+	err = setRules(t.rules())
 	if err != nil {
-		_ = t.unsetRules()
-		return E.Errors(err, t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
+		return E.Errors(err, t.rollbackAutoRoute(tunLink))
 	}
 
 	if t.options.DNSModeOrDefault() != DNSModeDisabled {
 		err = t.setSearchDomainForSystemdResolved()
 		if err != nil {
-			return E.Cause(err, "set search domain")
+			return E.Errors(E.Cause(err, "set search domain"), t.rollbackAutoRoute(tunLink))
 		}
 	}
 
@@ -431,6 +430,10 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 		t.interfaceCallback = t.options.InterfaceMonitor.RegisterCallback(t.routeUpdate)
 	}
 	return nil
+}
+
+func (t *NativeTun) rollbackAutoRoute(tunLink netlink.Link) error {
+	return E.Errors(common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute0(tunLink))
 }
 
 func (t *NativeTun) enableGSO() error {
@@ -990,8 +993,8 @@ func (t *NativeTun) setRoute(tunLink netlink.Link) error {
 	return nil
 }
 
-func (t *NativeTun) setRules() error {
-	for i, rule := range t.rules() {
+func setRules(rules []*netlink.Rule) error {
+	for i, rule := range rules {
 		err := netlink.RuleAdd(rule)
 		if err != nil {
 			if rule.Type == unix.FR_ACT_UNREACHABLE && errors.Is(err, unix.EAFNOSUPPORT) {
@@ -1002,7 +1005,7 @@ func (t *NativeTun) setRules() error {
 					continue
 				}
 			}
-			return E.Cause(err, "add rule ", i, "/", len(t.rules()))
+			return E.Cause(err, "add rule ", i, "/", len(rules))
 		}
 	}
 	return nil
@@ -1085,8 +1088,10 @@ func (t *NativeTun) unsetAddresses() {
 }
 
 func (t *NativeTun) resetRules() error {
-	t.unsetRules()
-	return t.setRules()
+	if err := t.unsetRules(); err != nil {
+		return err
+	}
+	return setRules(t.rules())
 }
 
 func (t *NativeTun) routeUpdate(_ *control.Interface, flags int) {
