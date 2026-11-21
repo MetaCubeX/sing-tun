@@ -177,7 +177,13 @@ func (t *NativeTun) configure() error {
 		}
 		err = inet6If.Set()
 		if err != nil {
-			return E.Cause(err, "set ipv6 options")
+			// The IPv6 address is already configured above, so these interface options are
+			// best-effort. Some Windows builds reject them on a freshly created wintun
+			// adapter with ERROR_INVALID_PARAMETER; aborting here would take the whole
+			// tunnel down even though the IPv4 side is fully usable.
+			if t.options.Logger != nil {
+				t.options.Logger.Warn("set ipv6 options: ", err)
+			}
 		}
 	}
 
