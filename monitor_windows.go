@@ -2,6 +2,7 @@ package tun
 
 import (
 	"net/netip"
+	"strings"
 	"sync"
 
 	"github.com/metacubex/sing-tun/internal/winipcfg"
@@ -88,6 +89,15 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 		}
 
 		if ifrow.Type == winipcfg.IfTypePropVirtual || ifrow.Type == winipcfg.IfTypeSoftwareLoopback {
+			continue
+		}
+
+		// Exclude wintun/tunnel virtual adapters.
+		// These register as IfType=6 (EthernetCSMACD) but are not physical NICs.
+		// Third-party wintun devices (e.g., OPPO Connect, ZeroTier) can interfere
+		// with TUN outbound routing if selected as the default interface.
+		desc := ifrow.Description()
+		if strings.Contains(desc, "Wintun") || strings.Contains(desc, "Tunnel") {
 			continue
 		}
 
