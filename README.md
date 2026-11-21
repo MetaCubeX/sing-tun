@@ -2,7 +2,7 @@
 
 Simple transparent proxy library.
 
-For Linux, Windows, macOS and iOS.
+For Linux, FreeBSD, Windows, macOS and iOS.
 
 ## License
 
