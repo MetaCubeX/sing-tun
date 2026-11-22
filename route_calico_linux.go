@@ -4,16 +4,50 @@ package tun
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"github.com/sagernet/netlink/nl"
-	"golang.org/x/sys/unix"
 	"net"
 	"net/netip"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/sagernet/netlink/nl"
 	"golang.org/x/exp/slices"
+	"golang.org/x/sys/unix"
+)
+
+var errUnsupportedCalicoCTABI = errors.New("unsupported Calico conntrack map ABI")
+
+const (
+	// Calico v3.32+ conntrack v4 map layout (felix/bpf/conntrack/v4/map{,6}.go).
+	calicoCT4PathV4    = "/sys/fs/bpf/tc/globals/cali_v4_ct4"
+	calicoCT4PathV6    = "/sys/fs/bpf/tc/globals/cali_v6_ct4"
+	calicoCT4NameV4    = "cali_v4_ct4"
+	calicoCT4NameV6    = "cali_v6_ct4"
+	calicoCT4KeySizeV4 = 16
+	calicoCT4ValSizeV4 = 88
+	calicoCT4KeySizeV6 = 40
+	calicoCT4ValSizeV6 = 128
+
+	calicoCTTypeOffset     = 16
+	calicoCTTypeNormal     = 0
+	calicoCTTypeNATForward = 1
+	calicoCTTypeNATReverse = 2
+
+	calicoCTLegAOffset     = 24
+	calicoCTLegBOffset     = 48
+	calicoCTLegFlagsOffset = 16
+	calicoCTLegIfidxOffset = 20
+
+	calicoCTLegFlagMask     = 0x70
+	calicoCTLegFlagPodOpen  = 0x70
+	calicoCTLegFlagWorkload = 0x50
+	calicoCTLegFlagPeerOpen = 0x30
+
+	calicoCTOrigBaseOffset = 72
+	calicoBPFMapInfoSize   = 40
 )
 
 type calicoFlowAction uint8
@@ -156,14 +190,21 @@ func parseCalicoServiceFlow(data []byte, reply bool) (flow calicoServiceFlow, er
 	return flow, nil
 }
 
+func calicoConntrackPath(ipv6 bool) string {
+	if ipv6 {
+		return calicoCT4PathV6
+	}
+	return calicoCT4PathV4
+}
+
 // Calico's pinned CT v4 ABI is shared by its IPv4 and IPv6 maps. Open it
 // read-only and verify its layout before interpreting any NAT state.
 func openCalicoConntrack(ipv6 bool) (int, error) {
-	name, keySize, valueSize := "cali_v4_ct4", uint32(16), uint32(88)
+	name, keySize, valueSize := calicoCT4NameV4, uint32(calicoCT4KeySizeV4), uint32(calicoCT4ValSizeV4)
 	if ipv6 {
-		name, keySize, valueSize = "cali_v6_ct4", 40, 128
+		name, keySize, valueSize = calicoCT4NameV6, calicoCT4KeySizeV6, calicoCT4ValSizeV6
 	}
-	path, err := unix.BytePtrFromString("/sys/fs/bpf/tc/globals/" + name)
+	path, err := unix.BytePtrFromString(calicoConntrackPath(ipv6))
 	if err != nil {
 		return -1, err
 	}
@@ -176,46 +217,71 @@ func openCalicoConntrack(ipv6 bool) (int, error) {
 	if errno != 0 {
 		return -1, errno
 	}
-	var info [40]byte
+	var info [calicoBPFMapInfoSize]byte
 	query := struct {
 		FD, Size uint32
 		Info     uint64
 	}{uint32(fd), uint32(len(info)), uint64(uintptr(unsafe.Pointer(&info[0])))}
 	_, _, errno = unix.Syscall(unix.SYS_BPF, unix.BPF_OBJ_GET_INFO_BY_FD, uintptr(unsafe.Pointer(&query)), unsafe.Sizeof(query))
-	if errno != 0 || nl.NativeEndian().Uint32(info[0:4]) != unix.BPF_MAP_TYPE_LRU_HASH || nl.NativeEndian().Uint32(info[8:12]) != keySize || nl.NativeEndian().Uint32(info[12:16]) != valueSize || string(info[24:24+len(name)]) != name {
+	runtime.KeepAlive(&info)
+	if errno != 0 ||
+		nl.NativeEndian().Uint32(info[0:4]) != unix.BPF_MAP_TYPE_LRU_HASH ||
+		nl.NativeEndian().Uint32(info[8:12]) != keySize ||
+		nl.NativeEndian().Uint32(info[12:16]) != valueSize ||
+		string(info[24:24+len(name)]) != name ||
+		(24+len(name) < len(info) && info[24+len(name)] != 0) {
 		unix.Close(int(fd))
 		if errno != 0 {
 			return -1, errno
 		}
-		return -1, fmt.Errorf("unsupported Calico conntrack map ABI: %s", name)
+		return -1, fmt.Errorf("%w: %s", errUnsupportedCalicoCTABI, name)
 	}
 	return int(fd), nil
 }
 
+type calicoLookupBuffers struct {
+	key   [calicoCT4KeySizeV6]byte
+	value [calicoCT4ValSizeV6]byte
+}
+
 func (f calicoServiceFlow) classifyCalicoFlow(fd int, scope serviceForwardScope) calicoFlowAction {
+	return f.classifyCalicoFlowWithBuf(fd, scope, nil)
+}
+
+func (f calicoServiceFlow) classifyCalicoFlowWithBuf(fd int, scope serviceForwardScope, buf *calicoLookupBuffers) calicoFlowAction {
 	if f.mark != 0 || (f.protocol != unix.IPPROTO_TCP && f.protocol != unix.IPPROTO_UDP) || !f.source.IsValid() || !f.destination.IsValid() {
 		return calicoUnclassified
 	}
-	var backend bool
-	for _, prefix := range scope.backends {
-		backend = backend || prefix.Contains(f.source)
-	}
-	if !backend {
+	if !scope.hasBackend(f.source) {
 		return calicoUnclassified
 	}
-	length, valueSize := 4, 88
+	length, valueSize := 4, calicoCT4ValSizeV4
 	if f.source.Is6() {
-		length, valueSize = 16, 128
+		length, valueSize = 16, calicoCT4ValSizeV6
 	}
-	key, value := make([]byte, 8+2*length), make([]byte, valueSize)
+	var key, value []byte
+	if buf != nil {
+		key = buf.key[:8+2*length]
+		value = buf.value[:valueSize]
+	} else {
+		key = make([]byte, 8+2*length)
+		value = make([]byte, valueSize)
+	}
 	nl.NativeEndian().PutUint32(key[:4], uint32(f.protocol))
 	for direction := 0; direction < 2; direction++ {
 		a, b, pa, pb := f.source, f.destination, f.sourcePort, f.destinationPort
 		if direction == 1 {
 			a, b, pa, pb = b, a, pb, pa
 		}
-		copy(key[4:], a.AsSlice())
-		copy(key[4+length:], b.AsSlice())
+		if length == 4 {
+			a4, b4 := a.As4(), b.As4()
+			copy(key[4:8], a4[:])
+			copy(key[8:12], b4[:])
+		} else {
+			a16, b16 := a.As16(), b.As16()
+			copy(key[4:20], a16[:])
+			copy(key[20:36], b16[:])
+		}
 		nl.NativeEndian().PutUint16(key[4+2*length:], pa)
 		nl.NativeEndian().PutUint16(key[6+2*length:], pb)
 		attr := struct {
@@ -228,30 +294,32 @@ func (f calicoServiceFlow) classifyCalicoFlow(fd int, scope serviceForwardScope)
 		if errno != 0 {
 			continue
 		}
-		if value[16] == 0 || value[16] == 1 {
+		if value[calicoCTTypeOffset] == calicoCTTypeNormal || value[calicoCTTypeOffset] == calicoCTTypeNATForward {
 			return calicoTunnel
 		}
-		if value[16] != 2 {
+		if value[calicoCTTypeOffset] != calicoCTTypeNATReverse {
 			return calicoUnclassified
 		}
 		// The workload did not open this flow. Its peer did so at a real
 		// uplink, and the pre-NAT Service address belongs to that uplink.
-		workloadLeg, clientLeg := 24, 48
+		workloadLeg, clientLeg := calicoCTLegAOffset, calicoCTLegBOffset
 		if direction == 1 {
 			workloadLeg, clientLeg = clientLeg, workloadLeg
 		}
-		wf, cf := nl.NativeEndian().Uint32(value[workloadLeg+16:]), nl.NativeEndian().Uint32(value[clientLeg+16:])
-		if wf&0x70 == 0x70 {
+		wf := nl.NativeEndian().Uint32(value[workloadLeg+calicoCTLegFlagsOffset:])
+		cf := nl.NativeEndian().Uint32(value[clientLeg+calicoCTLegFlagsOffset:])
+		if wf&calicoCTLegFlagMask == calicoCTLegFlagPodOpen {
 			return calicoTunnel
 		}
-		if wf&0x70 != 0x50 || cf&0x70 != 0x30 {
+		if wf&calicoCTLegFlagMask != calicoCTLegFlagWorkload || cf&calicoCTLegFlagMask != calicoCTLegFlagPeerOpen {
 			return calicoUnclassified
 		}
-		wi, ci := nl.NativeEndian().Uint32(value[workloadLeg+20:]), nl.NativeEndian().Uint32(value[clientLeg+20:])
+		wi := nl.NativeEndian().Uint32(value[workloadLeg+calicoCTLegIfidxOffset:])
+		ci := nl.NativeEndian().Uint32(value[clientLeg+calicoCTLegIfidxOffset:])
 		if f.input == 0 || wi != f.input {
 			return calicoUnclassified
 		}
-		original := 72 + length
+		original := calicoCTOrigBaseOffset + length
 		originalIP, _ := netip.AddrFromSlice(value[original : original+length])
 		originalSource, _ := netip.AddrFromSlice(value[original+length+4 : original+2*length+4])
 		if originalSource != f.destination || nl.NativeEndian().Uint16(value[original+length:]) == 0 {
@@ -272,19 +340,67 @@ type calicoTopology struct {
 	version    *atomic.Uint64
 	workloads  map[int]string
 	uplinks    map[int][]netip.Addr
+
+	fallbackMu        sync.Mutex
+	fallbackGen       uint64
+	fallbackWorkloads map[int]bool
+	fallbackUplinks   map[int][]netip.Addr
 }
 
 func (s serviceForwardScope) matchesCalicoInterfaces(workloadIndex, clientIndex int, originalIP netip.Addr) bool {
-	if topology := s.calico; topology != nil && topology.version.Load() == topology.generation {
-		return topology.workloads[workloadIndex] != "" && slices.Contains(topology.uplinks[clientIndex], originalIP)
+	if topology := s.calico; topology != nil {
+		current := topology.version.Load()
+		if current == topology.generation {
+			return topology.workloads[workloadIndex] != "" && slices.Contains(topology.uplinks[clientIndex], originalIP)
+		}
+		// Cache fallback interface queries per topology version so a packet burst
+		// during a route refresh does not issue repeated netlink dumps per packet.
+		return topology.matchFallback(current, s.uplinks, workloadIndex, clientIndex, originalIP)
 	}
-	// Preserve classification while the route worker refreshes a stale snapshot.
+	return matchCalicoInterfacesLive(s.uplinks, workloadIndex, clientIndex, originalIP)
+}
+
+func (t *calicoTopology) matchFallback(current uint64, uplinks []string, workloadIndex, clientIndex int, originalIP netip.Addr) bool {
+	t.fallbackMu.Lock()
+	defer t.fallbackMu.Unlock()
+	if t.fallbackGen != current || t.fallbackWorkloads == nil {
+		t.fallbackGen = current
+		t.fallbackWorkloads = make(map[int]bool)
+		t.fallbackUplinks = make(map[int][]netip.Addr)
+	}
+	isWorkload, ok := t.fallbackWorkloads[workloadIndex]
+	if !ok {
+		workload, err := net.InterfaceByIndex(workloadIndex)
+		isWorkload = err == nil && len(workload.Name) >= 4 && workload.Name[:4] == "cali"
+		t.fallbackWorkloads[workloadIndex] = isWorkload
+	}
+	if !isWorkload {
+		return false
+	}
+	addrs, ok := t.fallbackUplinks[clientIndex]
+	if !ok {
+		client, err := net.InterfaceByIndex(clientIndex)
+		if err == nil && slices.Contains(uplinks, client.Name) {
+			if rawAddrs, err := client.Addrs(); err == nil {
+				for _, address := range rawAddrs {
+					if prefix, err := netip.ParsePrefix(address.String()); err == nil {
+						addrs = append(addrs, prefix.Addr().Unmap())
+					}
+				}
+			}
+		}
+		t.fallbackUplinks[clientIndex] = addrs
+	}
+	return slices.Contains(addrs, originalIP)
+}
+
+func matchCalicoInterfacesLive(uplinks []string, workloadIndex, clientIndex int, originalIP netip.Addr) bool {
 	workload, err := net.InterfaceByIndex(workloadIndex)
 	if err != nil || len(workload.Name) < 4 || workload.Name[:4] != "cali" {
 		return false
 	}
 	client, err := net.InterfaceByIndex(clientIndex)
-	if err != nil || !slices.Contains(s.uplinks, client.Name) {
+	if err != nil || !slices.Contains(uplinks, client.Name) {
 		return false
 	}
 	addresses, err := client.Addrs()

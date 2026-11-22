@@ -376,6 +376,35 @@ s.sendto(b"external-dns-query", ("203.0.113.7", 53))
 	readCalicoTestTUN(t, n, "external-dns-query")
 }
 
+func TestCalicoConntrackCacheReusesFDAndDetectsReplacement(t *testing.T) {
+	runCalicoIntegration(t, func() {
+		mountCalicoTestBPFFS(t)
+		q := &calicoServiceQueue{ctCache: [2]calicoConntrackCache{{fd: -1}, {fd: -1}}}
+		defer q.closeConntrack()
+
+		require.Equal(t, -1, q.conntrackFD(false))
+
+		path := calicoCT4PathV4
+		fd1 := createCalicoTestMap(t, calicoCT4NameV4, calicoCT4KeySizeV4, calicoCT4ValSizeV4, unix.BPF_MAP_TYPE_LRU_HASH)
+		pinCalicoTestMap(t, fd1, path)
+
+		cached1 := q.conntrackFD(false)
+		require.GreaterOrEqual(t, cached1, 0)
+		cached2 := q.conntrackFD(false)
+		require.Equal(t, cached1, cached2, "unchanged map inode must reuse cached FD")
+
+		require.NoError(t, os.Remove(path))
+		fd2 := createCalicoTestMap(t, calicoCT4NameV4, calicoCT4KeySizeV4, calicoCT4ValSizeV4, unix.BPF_MAP_TYPE_LRU_HASH)
+		pinCalicoTestMap(t, fd2, path)
+
+		cached3 := q.conntrackFD(false)
+		require.GreaterOrEqual(t, cached3, 0)
+		var st unix.Stat_t
+		require.NoError(t, unix.Stat(path, &st))
+		require.Equal(t, st.Ino, q.ctCache[0].ino, "replaced map must refresh cached inode")
+	})
+}
+
 func TestDNSHijackIgnoresZeroValueRules(t *testing.T) {
 	r := &autoRedirect{
 		iptablesPath: "/usr/sbin/iptables",
@@ -604,6 +633,72 @@ print(s.recv(1024).decode(), flush=True)
 				require.Regexp(t, regexp.MustCompile(`packets 2 bytes [0-9]+ comment "kept-both"`), text)
 				require.Regexp(t, regexp.MustCompile(`packets 0 bytes 0 comment "lost-low"`), text)
 			})
+		})
+	}
+}
+
+func TestServiceBackendIndexMatchesPrefixes(t *testing.T) {
+	prefixes := []netip.Prefix{
+		netip.MustParsePrefix("10.85.1.27/32"),
+		netip.MustParsePrefix("10.85.2.0/24"),
+		netip.MustParsePrefix("fd00:1::27/128"),
+		netip.MustParsePrefix("fd00:2::/64"),
+	}
+	indexed := serviceForwardScope{
+		backends:     prefixes,
+		backendIndex: buildServiceBackendIndex(prefixes),
+	}
+	fallback := serviceForwardScope{backends: prefixes}
+	for _, tc := range []struct {
+		addr netip.Addr
+		want bool
+	}{
+		{netip.MustParseAddr("10.85.1.27"), true},
+		{netip.MustParseAddr("10.85.1.28"), false},
+		{netip.MustParseAddr("10.85.2.99"), true},
+		{netip.MustParseAddr("fd00:1::27"), true},
+		{netip.MustParseAddr("fd00:1::28"), false},
+		{netip.MustParseAddr("fd00:2::1234"), true},
+	} {
+		require.Equal(t, tc.want, indexed.hasBackend(tc.addr), "indexed %s", tc.addr)
+		require.Equal(t, tc.want, fallback.hasBackend(tc.addr), "fallback %s", tc.addr)
+	}
+}
+
+func BenchmarkClassifyCalicoFlow(b *testing.B) {
+	for _, pods := range []int{1, 100, 1000} {
+		backends := make([]netip.Prefix, pods)
+		for i := 0; i < pods; i++ {
+			addr := netip.AddrFrom4([4]byte{10, 85, byte(i >> 8), byte(i)})
+			backends[i] = netip.PrefixFrom(addr, 32)
+		}
+		target := backends[pods-1].Addr()
+		scope := serviceForwardScope{
+			backends:     backends,
+			backendIndex: buildServiceBackendIndex(backends),
+		}
+		flow := calicoServiceFlow{
+			protocol:        unix.IPPROTO_UDP,
+			source:          target,
+			destination:     netip.MustParseAddr("203.0.113.7"),
+			sourcePort:      18888,
+			destinationPort: 18889,
+			input:           1,
+		}
+		b.Run(fmt.Sprintf("reused-buf-pods=%d", pods), func(b *testing.B) {
+			var buf calicoLookupBuffers
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = flow.classifyCalicoFlowWithBuf(-1, scope, &buf)
+			}
+		})
+		b.Run(fmt.Sprintf("unbuffered-pods=%d", pods), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = flow.classifyCalicoFlow(-1, scope)
+			}
 		})
 	}
 }

@@ -27,8 +27,28 @@ const (
 	nfqPayload           = 10
 	nfqConntrack         = 11
 	nfqConntrackInfo     = 12
+	nfqCfgCmd            = 1
+	nfqCfgParams         = 2
+	nfqCfgFlags          = 4
+	nfqCfgMask           = 5
+	nfqCfgCmdBind        = 1
+	nfqCopyPacket        = 2
+	nfqCopyRange         = 2048 // room for IPv6 extension headers without copying a full GSO skb
+	nfqFlagFailOpen      = 1 << 0
+	nfqFlagConntrack     = 1 << 1
+	nfqFlagGSO           = 1 << 2
+	nfqVerdictAccept     = 1
+	ctaMarkMask          = 21
+	calicoQueueRecvBuf   = 4 << 20
 	calicoQueueInventory = "/proc/net/netfilter/nfnetlink_queue"
 )
+
+type calicoConntrackCache struct {
+	valid bool
+	fd    int
+	dev   uint64
+	ino   uint64
+}
 
 // Classify workload packets before routing. The skb stays in the kernel,
 // including its GSO, checksum and any conntrack state.
@@ -41,6 +61,8 @@ type calicoServiceQueue struct {
 	bypass    *autoRouteDNATBypass
 	access    sync.RWMutex
 	scopes    [2]serviceForwardScope
+	ctCache   [2]calicoConntrackCache
+	lookupBuf calicoLookupBuffers
 }
 
 func newCalicoServiceQueue(b *autoRouteDNATBypass) (*calicoServiceQueue, error) {
@@ -48,7 +70,15 @@ func newCalicoServiceQueue(b *autoRouteDNATBypass) (*calicoServiceQueue, error) 
 	if err != nil {
 		return nil, err
 	}
-	q := &calicoServiceQueue{socket: socket, number: uint16(b.options.IPRoute2TableIndex), done: make(chan struct{}), bypass: b, scopes: b.forwardScopes}
+	_ = unix.SetsockoptInt(socket.GetFd(), unix.SOL_SOCKET, unix.SO_RCVBUF, calicoQueueRecvBuf)
+	q := &calicoServiceQueue{
+		socket:  socket,
+		number:  uint16(b.options.IPRoute2TableIndex),
+		done:    make(chan struct{}),
+		bypass:  b,
+		scopes:  b.forwardScopes,
+		ctCache: [2]calicoConntrackCache{{fd: -1}, {fd: -1}},
+	}
 	handle := map[int]*nl.SocketHandle{unix.NETLINK_NETFILTER: {Socket: socket}}
 	config := func(attrs ...*nl.RtAttr) error {
 		req := q.request(nfqMessageConfig, unix.NLM_F_ACK, unix.AF_UNSPEC)
@@ -59,7 +89,7 @@ func newCalicoServiceQueue(b *autoRouteDNATBypass) (*calicoServiceQueue, error) 
 		_, err := req.Execute(unix.NETLINK_NETFILTER, 0)
 		return err
 	}
-	bind := nl.NewRtAttr(1, []byte{1, 0, 0, 0})
+	bind := nl.NewRtAttr(nfqCfgCmd, []byte{nfqCfgCmdBind, 0, 0, 0})
 	err = config(bind)
 	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EBUSY) {
 		// Route table IDs are wider than NFQUEUE IDs. The kernel also
@@ -74,10 +104,12 @@ func newCalicoServiceQueue(b *autoRouteDNATBypass) (*calicoServiceQueue, error) 
 	}
 	if err == nil {
 		// TCP replies can lack CT after BPF delivers peer ACKs directly.
-		// Include room for IPv6 extension headers without copying a full GSO skb.
-		params := []byte{0, 0, 8, 0, 2}
-		flags := []byte{0, 0, 0, 7} // fail open, conntrack metadata, GSO
-		err = config(nl.NewRtAttr(2, params), nl.NewRtAttr(4, flags), nl.NewRtAttr(5, flags))
+		var params [5]byte
+		binary.BigEndian.PutUint32(params[:4], nfqCopyRange)
+		params[4] = nfqCopyPacket
+		var flags [4]byte
+		binary.BigEndian.PutUint32(flags[:], nfqFlagFailOpen|nfqFlagConntrack|nfqFlagGSO)
+		err = config(nl.NewRtAttr(nfqCfgParams, params[:]), nl.NewRtAttr(nfqCfgFlags, flags[:]), nl.NewRtAttr(nfqCfgMask, flags[:]))
 	}
 	if err != nil {
 		socket.Close()
@@ -144,6 +176,49 @@ func (q *calicoServiceQueue) running() bool {
 	}
 }
 
+func (q *calicoServiceQueue) conntrackFD(ipv6 bool) int {
+	index := 0
+	if ipv6 {
+		index = 1
+	}
+	cache := &q.ctCache[index]
+	var st unix.Stat_t
+	if err := unix.Stat(calicoConntrackPath(ipv6), &st); err != nil {
+		if cache.fd >= 0 {
+			_ = unix.Close(cache.fd)
+		}
+		*cache = calicoConntrackCache{fd: -1}
+		return -1
+	}
+	if cache.valid && cache.dev == st.Dev && cache.ino == st.Ino {
+		return cache.fd
+	}
+	if cache.fd >= 0 {
+		_ = unix.Close(cache.fd)
+	}
+	fd, err := openCalicoConntrack(ipv6)
+	if err != nil {
+		if errors.Is(err, errUnsupportedCalicoCTABI) {
+			// Negative-cache deterministic ABI mismatches until the pinned map inode changes.
+			*cache = calicoConntrackCache{valid: true, fd: -1, dev: st.Dev, ino: st.Ino}
+		} else {
+			*cache = calicoConntrackCache{fd: -1}
+		}
+		return -1
+	}
+	*cache = calicoConntrackCache{valid: true, fd: fd, dev: st.Dev, ino: st.Ino}
+	return fd
+}
+
+func (q *calicoServiceQueue) closeConntrack() {
+	for i := range q.ctCache {
+		if q.ctCache[i].fd >= 0 {
+			_ = unix.Close(q.ctCache[i].fd)
+			q.ctCache[i] = calicoConntrackCache{fd: -1}
+		}
+	}
+}
+
 func (q *calicoServiceQueue) run() {
 	interrupted := true
 	defer func() {
@@ -155,11 +230,20 @@ func (q *calicoServiceQueue) run() {
 			}
 		}
 	}()
+	defer q.closeConntrack()
 	defer q.socket.Close()
 	defer q.reader.Close()
+	conn, err := q.reader.SyscallConn()
+	if err != nil {
+		interrupted = !errors.Is(err, os.ErrClosed)
+		if interrupted && q.bypass.options.Logger != nil {
+			q.bypass.options.Logger.Warn("Calico service queue stopped: ", err)
+		}
+		return
+	}
 	var data [65536]byte
 	for {
-		messages, from, err := q.receive(data[:])
+		messages, from, err := q.receive(conn, data[:])
 		if err != nil {
 			if errors.Is(err, unix.ENOBUFS) {
 				continue
@@ -200,15 +284,11 @@ func (q *calicoServiceQueue) run() {
 	}
 }
 
-func (q *calicoServiceQueue) receive(data []byte) ([]syscall.NetlinkMessage, *unix.SockaddrNetlink, error) {
-	conn, err := q.reader.SyscallConn()
-	if err != nil {
-		return nil, nil, err
-	}
+func (q *calicoServiceQueue) receive(conn syscall.RawConn, data []byte) ([]syscall.NetlinkMessage, *unix.SockaddrNetlink, error) {
 	var size int
 	var from unix.Sockaddr
 	var receiveErr error
-	err = conn.Read(func(fd uintptr) bool {
+	err := conn.Read(func(fd uintptr) bool {
 		for {
 			size, from, receiveErr = unix.Recvfrom(int(fd), data, unix.MSG_TRUNC)
 			if receiveErr != unix.EINTR {
@@ -314,7 +394,7 @@ func (q *calicoServiceQueue) verdict(data []byte) error {
 	}
 	req := q.request(nfqMessageVerdict, 0, data[0])
 	header := make([]byte, 8)
-	binary.BigEndian.PutUint32(header[:4], 1)
+	binary.BigEndian.PutUint32(header[:4], nfqVerdictAccept)
 	binary.BigEndian.PutUint32(header[4:], id)
 	req.AddData(nl.NewRtAttr(nfqVerdictHeader, header))
 	b := q.bypass
@@ -344,10 +424,8 @@ func (q *calicoServiceQueue) verdict(data []byte) error {
 		scope := q.scopes[i]
 		q.access.RUnlock()
 		action := calicoUnclassified
-		fd, err := openCalicoConntrack(i == 1)
-		if err == nil {
-			action = flow.classifyCalicoFlow(fd, scope)
-			unix.Close(fd)
+		if fd := q.conntrackFD(i == 1); fd >= 0 {
+			action = flow.classifyCalicoFlowWithBuf(fd, scope, &q.lookupBuf)
 		}
 		if action == calicoNativeReply {
 			routeMark = mark&^routeMask | b.options.autoRouteDNATBypassMark()
@@ -364,7 +442,7 @@ func (q *calicoServiceQueue) verdict(data []byte) error {
 			binary.BigEndian.PutUint32(mask, b.serviceConnmarkMask(ctmark))
 			state := nl.NewRtAttr(nfqConntrack|unix.NLA_F_NESTED, nil)
 			nl.NewRtAttrChild(state, nl.CTA_MARK, value)
-			nl.NewRtAttrChild(state, 21, mask)
+			nl.NewRtAttrChild(state, ctaMarkMask, mask)
 			req.AddData(state)
 		}
 	}

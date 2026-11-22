@@ -20,11 +20,55 @@ import (
 
 type serviceForwardScope struct {
 	backends        []netip.Prefix
+	backendIndex    *serviceBackendIndex
 	uplinks         []string
 	calicoWorkloads bool
 	cilium          bool
 	queueNumber     uint16
 	calico          *calicoTopology
+}
+
+type serviceBackendIndex struct {
+	hosts    map[netip.Addr]struct{}
+	prefixes []netip.Prefix
+}
+
+func buildServiceBackendIndex(backends []netip.Prefix) *serviceBackendIndex {
+	if len(backends) == 0 {
+		return nil
+	}
+	index := &serviceBackendIndex{}
+	for _, prefix := range backends {
+		if prefix.IsSingleIP() {
+			if index.hosts == nil {
+				index.hosts = make(map[netip.Addr]struct{}, len(backends))
+			}
+			index.hosts[prefix.Addr()] = struct{}{}
+		} else {
+			index.prefixes = append(index.prefixes, prefix)
+		}
+	}
+	return index
+}
+
+func (s serviceForwardScope) hasBackend(addr netip.Addr) bool {
+	if s.backendIndex != nil {
+		if _, ok := s.backendIndex.hosts[addr]; ok {
+			return true
+		}
+		for _, prefix := range s.backendIndex.prefixes {
+			if prefix.Contains(addr) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, prefix := range s.backends {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // With Cilium's MARK_MAGIC_IDENTITY the upper 16 and lower 8 bits hold
@@ -87,8 +131,14 @@ func (b *autoRouteDNATBypass) syncServiceForward(i int, scope serviceForwardScop
 	})
 	scope.backends = slices.Compact(scope.backends)
 	old := b.forwardScopes[i]
+	backendsEqual := slices.Equal(old.backends, scope.backends)
+	if backendsEqual {
+		scope.backendIndex = old.backendIndex
+	} else {
+		scope.backendIndex = buildServiceBackendIndex(scope.backends)
+	}
 	if old.queueNumber != scope.queueNumber || old.calicoWorkloads != scope.calicoWorkloads || old.cilium != scope.cilium ||
-		!slices.Equal(old.backends, scope.backends) || !slices.Equal(old.uplinks, scope.uplinks) {
+		!backendsEqual || !slices.Equal(old.uplinks, scope.uplinks) {
 		var err error
 		if b.useNFTables {
 			err = b.replaceNFTServiceForward(i, scope)
