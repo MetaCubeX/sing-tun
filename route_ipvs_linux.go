@@ -29,12 +29,18 @@ const (
 	ipvsDNSRefreshInterval = 5 * time.Second
 )
 
+type ipvsSnapshot struct {
+	destinations []ipvsDNSDestination
+	hasServices  [2]bool
+}
+
 type autoRouteIPVSDNSBypass struct {
 	path string
 
 	topologyVersion atomic.Uint64
 	access          sync.RWMutex
 	destinations    []ipvsDNSDestination
+	hasServices     [2]bool
 	started         bool
 	closeOnce       sync.Once
 	events          chan struct{}
@@ -54,9 +60,10 @@ func newAutoRouteIPVSDNSBypass(path string) (*autoRouteIPVSDNSBypass, error) {
 		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
-	destinations, err := bypass.Load()
+	snapshot, err := bypass.LoadSnapshot()
 	if err == nil {
-		bypass.destinations = destinations
+		bypass.destinations = snapshot.destinations
+		bypass.hasServices = snapshot.hasServices
 	}
 	return bypass, err
 }
@@ -163,11 +170,16 @@ func (b *autoRouteIPVSDNSBypass) Close() {
 }
 
 func (b *autoRouteIPVSDNSBypass) Load() ([]ipvsDNSDestination, error) {
-	destinations, err := readIPVSDNSDestinations(b.path)
+	snapshot, err := b.LoadSnapshot()
+	return snapshot.destinations, err
+}
+
+func (b *autoRouteIPVSDNSBypass) LoadSnapshot() (ipvsSnapshot, error) {
+	snapshot, err := readIPVSSnapshot(b.path)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return ipvsSnapshot{}, nil
 	}
-	return destinations, err
+	return snapshot, err
 }
 
 func (b *autoRouteIPVSDNSBypass) Destinations() []ipvsDNSDestination {
@@ -180,6 +192,22 @@ func (b *autoRouteIPVSDNSBypass) Replace(destinations []ipvsDNSDestination) {
 	b.access.Lock()
 	b.destinations = append([]ipvsDNSDestination(nil), destinations...)
 	b.access.Unlock()
+}
+
+func (b *autoRouteIPVSDNSBypass) setHasServices(hasServices [2]bool) {
+	b.access.Lock()
+	b.hasServices = hasServices
+	b.access.Unlock()
+}
+
+func (b *autoRouteIPVSDNSBypass) serviceActive(family int) bool {
+	if b == nil {
+		return false
+	}
+	b.access.RLock()
+	active := b.hasServices[family]
+	b.access.RUnlock()
+	return active
 }
 
 func (t *NativeTun) enableAutoRouteIPVSDNSBypass(path string) {
@@ -196,6 +224,7 @@ func (t *NativeTun) enableAutoRouteIPVSDNSBypass(path string) {
 func (t *NativeTun) refreshIPVSDNSBypass() {
 	t.routeAccess.Lock()
 	defer t.routeAccess.Unlock()
+
 	if b := t.dnatBypass; b != nil && b.useNFTables {
 		if err := b.refreshLocalDNATDestinations(); err != nil && t.options.Logger != nil {
 			t.options.Logger.Warn(E.Cause(err, "refresh published port destinations"))
@@ -212,15 +241,16 @@ func (t *NativeTun) refreshIPVSDNSBypass() {
 	if err := t.refreshServiceRoutes(); err != nil && t.options.Logger != nil {
 		t.options.Logger.Warn(E.Cause(err, "refresh eBPF service routes"))
 	}
-	newDestinations, err := t.ipvsDNSBypass.Load()
+	snapshot, err := t.ipvsDNSBypass.LoadSnapshot()
 	if err != nil {
 		if t.options.Logger != nil {
 			t.options.Logger.Warn(E.Cause(err, "refresh auto-route IPVS DNS bypass"))
 		}
 		return
 	}
+	t.ipvsDNSBypass.setHasServices(snapshot.hasServices)
 	oldDestinations := t.ipvsDNSBypass.Destinations()
-	installed, err := t.updateIPVSDNSRules(oldDestinations, newDestinations, addIPVSDNSRule, deleteIPVSDNSRule)
+	installed, err := t.updateIPVSDNSRules(oldDestinations, snapshot.destinations, addIPVSDNSRule, deleteIPVSDNSRule)
 	t.ipvsDNSBypass.Replace(installed)
 	if err != nil && t.options.Logger != nil {
 		t.options.Logger.Error(E.Cause(err, "update auto-route IPVS DNS bypass"))
@@ -262,10 +292,11 @@ func (t *NativeTun) updateIPVSDNSFamily(
 	oldDestinations, newDestinations []ipvsDNSDestination,
 	addRule, deleteRule ipvsDNSRuleOperation,
 ) ([]ipvsDNSDestination, error) {
+	active := t.ipvsDNSBypass.serviceActive(family)
 	if len(t.ipvsDNSPending) == 0 && slices.Equal(oldDestinations, newDestinations) {
 		// Retry the firewall even when all policy rules are already installed.
 		if t.dnatBypass != nil {
-			return oldDestinations, t.dnatBypass.updateIPVSDNSOutput(family, newDestinations)
+			return oldDestinations, t.dnatBypass.updateIPVSDNSOutput(family, newDestinations, active)
 		}
 		return oldDestinations, nil
 	}
@@ -292,7 +323,7 @@ func (t *NativeTun) updateIPVSDNSFamily(
 	// Only re-route packets after their lookup rules exist. Keep the old rules
 	// until the firewall has stopped selecting those endpoints.
 	if t.dnatBypass != nil {
-		if err := t.dnatBypass.updateIPVSDNSOutput(family, newDestinations); err != nil {
+		if err := t.dnatBypass.updateIPVSDNSOutput(family, newDestinations, active); err != nil {
 			return sortedIPVSDNSDestinations(currentDestinations), E.Cause(err, "replace IPVS DNS output rules")
 		}
 	}
@@ -373,18 +404,25 @@ func deleteIPVSDNSRule(rule *netlink.Rule) error {
 	return err
 }
 
-func readIPVSDNSDestinations(path string) ([]ipvsDNSDestination, error) {
+func readIPVSSnapshot(path string) (ipvsSnapshot, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return ipvsSnapshot{}, err
 	}
 	defer file.Close()
-	return parseIPVSDNSDestinations(file)
+	return parseIPVSSnapshot(file)
 }
 
 func parseIPVSDNSDestinations(reader io.Reader) ([]ipvsDNSDestination, error) {
+	snapshot, err := parseIPVSSnapshot(reader)
+	return snapshot.destinations, err
+}
+
+func parseIPVSSnapshot(reader io.Reader) (ipvsSnapshot, error) {
+	var snapshot ipvsSnapshot
 	destinationSet := make(map[ipvsDNSDestination]struct{})
 	var dnsProtocol int
+	serviceFamily := -1
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -394,36 +432,49 @@ func parseIPVSDNSDestinations(reader io.Reader) ([]ipvsDNSDestination, error) {
 		switch fields[0] {
 		case "TCP", "UDP":
 			dnsProtocol = 0
+			serviceFamily = -1
 			if len(fields) < 2 {
 				continue
 			}
-			_, port, parseErr := parseIPVSAddressPort(fields[1])
-			if parseErr == nil && port == 53 {
-				if fields[0] == "TCP" {
-					dnsProtocol = unix.IPPROTO_TCP
+			addr, port, parseErr := parseIPVSAddressPort(fields[1])
+			if parseErr == nil {
+				if addr.Is6() {
+					serviceFamily = 1
 				} else {
-					dnsProtocol = unix.IPPROTO_UDP
+					serviceFamily = 0
+				}
+				if port == 53 {
+					if fields[0] == "TCP" {
+						dnsProtocol = unix.IPPROTO_TCP
+					} else {
+						dnsProtocol = unix.IPPROTO_UDP
+					}
 				}
 			}
 		case "->":
-			if dnsProtocol == 0 || len(fields) < 2 {
+			if serviceFamily < 0 || len(fields) < 2 {
 				continue
 			}
 			address, port, parseErr := parseIPVSAddressPort(fields[1])
 			if parseErr == nil {
-				if port == 0 {
-					port = 53
-				} // IPVS retains the virtual port when no backend port is set.
-				destinationSet[ipvsDNSDestination{protocol: dnsProtocol, endpoint: netip.AddrPortFrom(address, port)}] = struct{}{}
+				snapshot.hasServices[serviceFamily] = true
+				if dnsProtocol != 0 {
+					if port == 0 {
+						port = 53
+					} // IPVS retains the virtual port when no backend port is set.
+					destinationSet[ipvsDNSDestination{protocol: dnsProtocol, endpoint: netip.AddrPortFrom(address, port)}] = struct{}{}
+				}
 			}
 		default:
 			dnsProtocol = 0
+			serviceFamily = -1
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return ipvsSnapshot{}, err
 	}
-	return sortedIPVSDNSDestinations(destinationSet), nil
+	snapshot.destinations = sortedIPVSDNSDestinations(destinationSet)
+	return snapshot, nil
 }
 
 func sortedIPVSDNSDestinations(destinationSet map[ipvsDNSDestination]struct{}) []ipvsDNSDestination {

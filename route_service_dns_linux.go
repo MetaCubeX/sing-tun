@@ -106,8 +106,18 @@ func (t *NativeTun) syncServicePlans(next [2]serviceRoutePlan) error {
 	return err
 }
 
+func isCNIDNSInterface(name string) bool {
+	switch name {
+	case "cni0", "cbr0", "tunl0", "vxlan.calico", "vxlan-v6.calico", "wireguard.cali", "wg-v6.cali":
+		return true
+	}
+	return strings.HasPrefix(name, "flannel.") || strings.HasPrefix(name, "flannel-")
+}
+
 // Socket load balancing can translate DNS to a backend before the first
 // lookup. Calico can route the Service itself to its BPF ingress device.
+// On iptables-legacy, mangle PREROUTING runs before kube-proxy DNAT, so
+// CNI pod routes also need direct port-53 lookups in the main table.
 func (t *NativeTun) discoverServiceRoutes() ([2]serviceRoutePlan, error) {
 	var next [2]serviceRoutePlan
 	for i := range next {
@@ -121,14 +131,19 @@ func (t *NativeTun) discoverServiceRoutes() ([2]serviceRoutePlan, error) {
 	if err != nil {
 		return next, err
 	}
+	legacyMode := t.dnatBypass != nil && !t.dnatBypass.useNFTables
 	gateways := make(map[int]string)
 	workloads := make(map[int]string)
+	cniDNS := make(map[int]bool)
 	var calicoBPF bool
 	for _, link := range links {
+		a := link.Attrs()
+		if isCNIDNSInterface(a.Name) {
+			cniDNS[a.Index] = true
+		}
 		if link.Type() != "veth" {
 			continue
 		}
-		a := link.Attrs()
 		switch {
 		case a.Name == "cilium_host" || a.Name == "bpfin.cali":
 			gateways[a.Index] = a.Name
@@ -137,7 +152,7 @@ func (t *NativeTun) discoverServiceRoutes() ([2]serviceRoutePlan, error) {
 			workloads[a.Index] = a.Name
 		}
 	}
-	if len(gateways) == 0 {
+	if len(gateways) == 0 && !(legacyMode && (len(workloads) > 0 || len(cniDNS) > 0)) {
 		return next, nil
 	}
 	if calicoBPF && t.ipvsDNSBypass != nil {
@@ -174,7 +189,7 @@ func (t *NativeTun) discoverServiceRoutes() ([2]serviceRoutePlan, error) {
 			prefixLength, _ = route.Dst.Mask.Size()
 		}
 		if prefixLength == 0 {
-			if route.Type != unix.RTN_UNICAST {
+			if len(gateways) == 0 || route.Type != unix.RTN_UNICAST {
 				continue
 			}
 			if route.LinkIndex != 0 {
@@ -199,14 +214,17 @@ func (t *NativeTun) discoverServiceRoutes() ([2]serviceRoutePlan, error) {
 
 		device := gateways[route.LinkIndex]
 		viaGateway := route.Type == unix.RTN_UNICAST && device != "" && route.Gw != nil
-		localBackend := route.Type == unix.RTN_UNICAST && calicoBPF && workloads[route.LinkIndex] != "" && dst.IsSingleIP()
+		onLinkCalico := route.Type == unix.RTN_UNICAST && workloads[route.LinkIndex] != "" && dst.IsSingleIP()
 		if route.Family == unix.AF_INET6 {
 			// IPv6 on-link routes are reported with universe scope.
-			localBackend = localBackend && len(route.Gw) == 0 && route.Via == nil && len(route.MultiPath) == 0
+			onLinkCalico = onLinkCalico && len(route.Gw) == 0 && route.Via == nil && len(route.MultiPath) == 0
 		} else {
-			localBackend = localBackend && route.Scope == netlink.SCOPE_LINK
+			onLinkCalico = onLinkCalico && route.Scope == netlink.SCOPE_LINK
 		}
-		isService := viaGateway || localBackend
+		localBackend := calicoBPF && onLinkCalico
+		cniOverlayDNS := (legacyMode || calicoBPF) && route.Type == unix.RTN_UNICAST && cniDNS[route.LinkIndex]
+		legacyCalicoDNS := legacyMode && onLinkCalico
+		isService := viaGateway || localBackend || cniOverlayDNS || legacyCalicoDNS
 		previous, exists := dns[dst]
 		if !exists || route.Priority < previous.metric || (route.Priority == previous.metric && !isService) {
 			dns[dst] = serviceDNSRoute{metric: route.Priority, service: isService}

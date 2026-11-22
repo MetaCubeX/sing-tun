@@ -45,6 +45,7 @@ type autoRouteDNATBypass struct {
 	iptablesPath  string
 	ip6tablesPath string
 	ipvsOutput    [2][]ipvsDNSDestination
+	ipvsActive    [2]bool
 	dnsRules      [2][]*netlink.Rule
 	forwardScopes [2]serviceForwardScope
 	calicoQueue   *calicoServiceQueue
@@ -203,6 +204,7 @@ func (b *autoRouteDNATBypass) cleanupBase() error {
 	}
 	if err == nil {
 		b.ipvsOutput = [2][]ipvsDNSDestination{}
+		b.ipvsActive = [2]bool{}
 		b.forwardScopes = [2]serviceForwardScope{}
 		b.localDNAT = [2][]netip.Prefix{}
 	}
@@ -352,6 +354,9 @@ func (b *autoRouteDNATBypass) refreshLocalDNATDestinations() error {
 	if err != nil {
 		return err
 	}
+	if slices.Equal(next[0], b.localDNAT[0]) && slices.Equal(next[1], b.localDNAT[1]) {
+		return nil
+	}
 	nft, err := nftables.New()
 	if err != nil {
 		return err
@@ -455,6 +460,7 @@ func (b *autoRouteDNATBypass) setupIPTables() error {
 			mark, mask := b.options.translatedDNSRoutingMark()
 			for _, protocol := range []string{"tcp", "udp"} {
 				if err := runIPTables(path, "-t", "mangle", "-A", b.chainName,
+					"!", "-i", "lo",
 					"-m", "addrtype", "--dst-type", "LOCAL", "-m", "conntrack", "--ctdir", "ORIGINAL",
 					"-p", protocol, "--dport", "53", "-m", "mark", "--mark", "0",
 					"-j", "MARK", "--set-xmark", fmt.Sprintf("%#x/%#x", mark, mask)); err != nil {
@@ -464,6 +470,7 @@ func (b *autoRouteDNATBypass) setupIPTables() error {
 		}
 		if err := runIPTables(
 			path, "-t", "mangle", "-A", b.chainName,
+			"!", "-i", "lo",
 			"-m", "addrtype", "--dst-type", "LOCAL",
 			"-m", "mark", "--mark", "0",
 			"-j", "MARK", "--set-xmark", fmt.Sprintf("%#x/%#x", b.options.autoRouteDNATBypassMark(), markMask),
