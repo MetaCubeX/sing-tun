@@ -50,7 +50,7 @@ func TestAutoRouteDNATBypassRule(t *testing.T) {
 	require.Equal(t, DefaultIPRoute2RuleIndex, rules[0].Priority)
 	require.True(t, rules[0].MarkSet)
 	require.Equal(t, uint32(0x2024), rules[0].Mark)
-	require.Equal(t, 0x2FFF, rules[0].Mask)
+	require.Equal(t, 0x2024, rules[0].Mask)
 	require.Equal(t, DefaultIPRoute2RuleIndex+10, rules[0].Goto)
 }
 
@@ -73,7 +73,7 @@ func TestAutoRedirectDNATBypassRule(t *testing.T) {
 	for _, index := range []int{0, 3} {
 		require.True(t, rules[index].MarkSet)
 		require.Equal(t, uint32(0x2024), rules[index].Mark)
-		require.Equal(t, 0x2FFF, rules[index].Mask)
+		require.Equal(t, 0x2024, rules[index].Mask)
 	}
 }
 
@@ -130,7 +130,7 @@ func TestDNATMarkExpressions(t *testing.T) {
 
 	mask, loaded := expressions[9].(*expr.Bitwise)
 	require.True(t, loaded)
-	require.Equal(t, binaryutil.NativeEndian.PutUint32(^uint32(0x2FFF)), mask.Mask)
+	require.Equal(t, binaryutil.NativeEndian.PutUint32(^uint32(0x2024)), mask.Mask)
 	require.Equal(t, binaryutil.NativeEndian.PutUint32(0x2024), mask.Xor)
 
 	meta, loaded := expressions[10].(*expr.Meta)
@@ -162,7 +162,7 @@ func TestAutoRouteDNATBypassUsesDefaultMark(t *testing.T) {
 func TestAutoRouteDNATBypassUsesConfiguredMarkField(t *testing.T) {
 	options := Options{AutoRedirectOutputMark: 0x12345678}
 	require.Equal(t, uint32(0x1678), options.autoRouteDNATBypassMark())
-	require.Equal(t, uint32(0x1FFF), options.autoRouteDNATBypassMask())
+	require.Equal(t, uint32(0x1678), options.autoRouteDNATBypassMask())
 }
 
 func TestAutoRouteDNATBypassUsesConfiguredHighMark(t *testing.T) {
@@ -176,10 +176,10 @@ func TestAutoRedirectDNATBypassDoesNotMatchInputMark(t *testing.T) {
 		name                string
 		input, output, mask uint32
 	}{
-		{"default", 0x2023, 0x2024, 0x2fff},
+		{"default", 0x2023, 0x2024, 0x2024},
 		{"high output shares input bit", 0x2023, 0x2000, 0x2001},
-		{"same low field", 0x2023, 0x1023, 0x1fff},
-		{"highest distinguishing bit", 0x80000023, 0x23, 0x80000fff},
+		{"same low field", 0x2023, 0x1023, 0x1023},
+		{"highest distinguishing bit", 0x80000023, 0x23, 0x80000023},
 		{"nonconflicting high output", 0x2023, 0x5000, 0x5000},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -729,7 +729,7 @@ func TestAutoRouteDNATBypassIPTables(t *testing.T) {
 	require.NoError(t, bypass.Start())
 	output, err := exec.Command(iptablesPath, "-t", "mangle", "-S", bypass.chainName).CombinedOutput()
 	require.NoError(t, err, string(output))
-	require.Contains(t, string(output), "--set-xmark 0x2024/0x2fff")
+	require.Contains(t, string(output), "--set-xmark 0x2024/0x2024")
 	require.NoError(t, bypass.Close())
 
 	output, err = exec.Command(iptablesPath, "-t", "mangle", "-S", bypass.chainName).CombinedOutput()

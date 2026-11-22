@@ -6,7 +6,9 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/metacubex/nftables"
 	"github.com/metacubex/sing/common/logger"
@@ -14,6 +16,53 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAutoRouteReconcilesRuntimeRPFilterChanges(t *testing.T) {
+	for name, markMode := range map[string]bool{"auto-route": false, "mark-mode": true} {
+		t.Run(name, func(t *testing.T) {
+			runCalicoIntegration(t, func() {
+				// Keep IPv6 address updates from driving the route watcher.
+				require.NoError(t, os.WriteFile("/proc/sys/net/ipv6/conf/all/disable_ipv6", []byte("1"), 0))
+				runTestIP(t, "link", "set", "lo", "up")
+				rpFilter := ipv4ConfPath + "/lo/rp_filter"
+				srcValidMark := ipv4ConfPath + "/lo/src_valid_mark"
+				require.NoError(t, os.WriteFile(ipv4ConfPath+"/all/rp_filter", []byte("0"), 0))
+				require.NoError(t, os.WriteFile(rpFilter, []byte("0"), 0))
+				require.NoError(t, os.WriteFile(srcValidMarkPath, []byte("0"), 0))
+				require.NoError(t, os.WriteFile(srcValidMark, []byte("0"), 0))
+
+				dev, err := New(Options{
+					Name: "test-tun", MTU: 1500, AutoRoute: true, DNSMode: DNSModeDisabled,
+					Inet4Address:                          []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
+					AutoRedirectMarkMode:                  markMode,
+					AutoRedirectInputMark:                 DefaultAutoRedirectInputMark,
+					AutoRedirectOutputMark:                DefaultAutoRedirectOutputMark,
+					IPRoute2RuleIndex:                     19000,
+					IPRoute2TableIndex:                    19001,
+					IPRoute2AutoRedirectFallbackRuleIndex: DefaultIPRoute2AutoRedirectFallbackRuleIndex,
+					Logger:                                logger.NOP(),
+				})
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, dev.Close()) })
+				require.NotNil(t, dev.(*NativeTun).dnatBypass)
+				value, err := os.ReadFile(srcValidMark)
+				require.NoError(t, err)
+				require.Equal(t, "0", strings.TrimSpace(string(value)))
+
+				require.NoError(t, os.WriteFile(rpFilter, []byte("1"), 0))
+				markEnabled := func() bool {
+					value, err := os.ReadFile(srcValidMark)
+					return err == nil && strings.TrimSpace(string(value)) == "1"
+				}
+				require.Eventually(t, markEnabled, 8*time.Second, 50*time.Millisecond,
+					"the periodic refresh must enable src_valid_mark after rp_filter is set to strict")
+				require.NoError(t, os.WriteFile(srcValidMark, []byte("0"), 0))
+				require.Eventually(t, markEnabled, 8*time.Second, 50*time.Millisecond,
+					"the periodic refresh must restore src_valid_mark after an external reset")
+			})
+		})
+	}
+}
 
 func TestConfigureDNSFailureCleansAutoRoute(t *testing.T) {
 	if os.Getenv("SING_TUN_INTEGRATION") != "1" {

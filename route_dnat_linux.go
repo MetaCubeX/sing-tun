@@ -26,7 +26,8 @@ import (
 
 const (
 	conntrackStatusDNAT = 1 << 5
-	// Reserve the low 12 bits for the bypass mark and preserve marks owned by other network components.
+	// Limit the bypass mark to bits owned by the output mark within the low 12-bit
+	// field (plus at most one high discriminator bit) so foreign mark bits stay intact.
 	autoRouteDNATBypassMarkFieldMask = 0xFFF
 )
 
@@ -82,9 +83,10 @@ func prepareAutoRouteDNATBypass(options *Options) (*autoRouteDNATBypass, error) 
 
 func newAutoRouteDNATBypass(options *Options) (*autoRouteDNATBypass, error) {
 	bypass := &autoRouteDNATBypass{
-		options:   options,
-		tableName: "sing-tun-route-" + strconv.Itoa(options.IPRoute2TableIndex),
-		chainName: "STUN-DNAT-" + strconv.Itoa(options.IPRoute2TableIndex),
+		options:       options,
+		tableName:     "sing-tun-route-" + strconv.Itoa(options.IPRoute2TableIndex),
+		chainName:     "STUN-DNAT-" + strconv.Itoa(options.IPRoute2TableIndex),
+		srcValidMarks: srcValidMarkOwner{tunName: options.Name},
 	}
 	var err error
 	nft, nftErr := nftables.New()
@@ -124,8 +126,8 @@ func (o *Options) autoRouteDNATBypassMark() uint32 {
 
 func (o *Options) autoRouteDNATBypassMask() uint32 {
 	outputMark := o.autoRouteOutputMark()
-	mask := uint32(autoRouteDNATBypassMarkFieldMask)
-	if outputMark&mask == 0 {
+	mask := outputMark & autoRouteDNATBypassMarkFieldMask
+	if mask == 0 {
 		mask = outputMark
 	} else {
 		// A shared low field alone must not look like our routing mark.
@@ -189,10 +191,7 @@ func (b *autoRouteDNATBypass) Close() error {
 		b.calicoQueue.Close()
 		b.calicoQueue = nil
 	}
-	if err == nil {
-		err = b.srcValidMarks.close()
-	}
-	return err
+	return errors.Join(err, b.srcValidMarks.close())
 }
 
 func (b *autoRouteDNATBypass) cleanupBase() error {

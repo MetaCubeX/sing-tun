@@ -14,13 +14,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var errSrcValidMarkChanged = errors.New("src_valid_mark was changed while in use")
+const maxPerInterfaceSrcValidMarkLeases = 16
 
 // The gate serializes changes to the value. Shared locks on the state file
 // last for as long as an instance needs the setting, including across processes.
 type srcValidMarkOwner struct {
 	leases   map[string]*srcValidMarkLease
 	stateDir string
+	tunName  string
 }
 
 type srcValidMarkLease struct {
@@ -63,10 +64,10 @@ func (o *srcValidMarkOwner) acquire(path string) error {
 			if err != nil {
 				return err
 			}
-			if strings.TrimSpace(string(value)) != "1" {
-				return fmt.Errorf("%s: %w", path, errSrcValidMarkChanged)
+			if strings.TrimSpace(string(value)) == "1" {
+				return nil
 			}
-			return nil
+			// Value was externally reset to 0; release and re-acquire under the gate lock to self-heal.
 		}
 		if err = o.release(path); err != nil {
 			return err
@@ -122,10 +123,6 @@ func (o *srcValidMarkOwner) acquire(path string) error {
 			_ = state.Close()
 		}
 	}()
-	leader := unix.Flock(int(state.Fd()), unix.LOCK_EX|unix.LOCK_NB)
-	if leader != nil && leader != unix.EWOULDBLOCK {
-		return leader
-	}
 	var value [8]byte
 	n, err := sysctl.Read(value[:])
 	if err != nil {
@@ -133,16 +130,24 @@ func (o *srcValidMarkOwner) acquire(path string) error {
 	}
 	switch strings.TrimSpace(string(value[:n])) {
 	case "0":
-		if leader != nil {
-			return fmt.Errorf("%s: %w", path, errSrcValidMarkChanged)
-		}
-		// Record ownership before writing so a replacement can recover it
-		// if this process exits between the write and unlocking the gate.
-		if err = state.Truncate(1); err != nil {
+		stateInfo, err := state.Stat()
+		if err != nil {
 			return err
 		}
+		hadOwnership := stateInfo.Size() > 0
+		// Record ownership before writing so a replacement can recover it
+		// if this process exits between the write and unlocking the gate.
+		// The exclusive gate lock serializes writes across concurrent owners.
+		if !hadOwnership {
+			if err = state.Truncate(1); err != nil {
+				return err
+			}
+		}
 		if err = writeSrcValidMark(path, info, "1"); err != nil {
-			return errors.Join(err, state.Truncate(0))
+			if !hadOwnership {
+				return errors.Join(err, state.Truncate(0))
+			}
+			return err
 		}
 	case "1":
 		// An empty state file means the value belongs to the administrator.
@@ -280,10 +285,12 @@ func (o *srcValidMarkOwner) requireForRPF(conf string, calicoIngress map[string]
 	}
 	needed := make(map[string]struct{})
 	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "all" || entry.Name() == "default" {
+		name := entry.Name()
+		tunInterface := name == o.tunName
+		if !entry.IsDir() || name == "all" || name == "default" || (tunInterface && len(calicoIngress) == 0) {
 			continue
 		}
-		iface := filepath.Join(conf, entry.Name())
+		iface := filepath.Join(conf, name)
 		filter, err := readRPFilter(filepath.Join(iface, "rp_filter"))
 		if isMissingSrcValidMark(err) {
 			continue
@@ -294,8 +301,8 @@ func (o *srcValidMarkOwner) requireForRPF(conf string, calicoIngress map[string]
 		if allFilter > filter {
 			filter = allFilter
 		}
-		_, calico := calicoIngress[entry.Name()]
-		if filter == 1 || filter == 2 && calico {
+		_, calico := calicoIngress[name]
+		if filter == 1 || filter == 2 && (calico || tunInterface) {
 			needed[filepath.Join(iface, "src_valid_mark")] = struct{}{}
 		}
 	}
@@ -307,15 +314,17 @@ func (o *srcValidMarkOwner) requireForRPF(conf string, calicoIngress map[string]
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(string(value)) == "1" {
-		return map[string]struct{}{allMark: {}}, o.acquire(allMark)
+	// Use a single namespace lease when already enabled or when the interface
+	// count would otherwise consume too many file descriptors.
+	if strings.TrimSpace(string(value)) == "1" || len(needed) > maxPerInterfaceSrcValidMarkLeases {
+		if err := o.acquire(allMark); err != nil {
+			return nil, err
+		}
+		return map[string]struct{}{allMark: {}}, nil
 	}
 	var interfaceErr error
 	for path := range needed {
 		if err := o.acquire(path); err != nil && !isMissingSrcValidMark(err) {
-			if errors.Is(err, errSrcValidMarkChanged) {
-				return nil, err
-			}
 			interfaceErr = errors.Join(interfaceErr, err)
 		}
 	}

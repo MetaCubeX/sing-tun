@@ -49,7 +49,7 @@ func TestWideMarkPreservesIPVSSelectors(t *testing.T) {
 		rule := n.ipvsDNSRules(ipvsDNSDestination{protocol: unix.IPPROTO_UDP, endpoint: netip.MustParseAddrPort("192.0.2.10:53")})[0]
 		require.NoError(t, addAutoRouteRule(rule))
 		rules := runTestIP(t, "-4", "rule", "show")
-		require.Contains(t, rules, "fwmark 0x80001020/0x80001fff")
+		require.Contains(t, rules, "fwmark 0x80000021/0x80000025")
 		require.Contains(t, rules, "ipproto udp")
 		require.Contains(t, rules, "dport 53")
 	})

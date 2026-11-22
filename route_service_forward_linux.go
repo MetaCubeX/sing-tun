@@ -111,14 +111,29 @@ func (b *autoRouteDNATBypass) syncServiceForward(i int, scope serviceForwardScop
 }
 
 // A FIB probe runs before netfilter. Distinguish a real, as yet unmarked
-// workload packet from that probe without granting it a native-route mark.
+// workload packet from that probe without granting it a native-route or
+// translated-DNS mark.
 func (b *autoRouteDNATBypass) forwardedInputMark() uint32 {
-	mark := uint32(DefaultAutoRedirectInputMark & autoRouteDNATBypassMarkFieldMask)
-	mask := b.options.autoRouteDNATBypassMask()
-	if mark&mask == b.options.autoRouteDNATBypassMark() {
-		mark ^= mask & -mask
+	bypassMark, bypassMask := b.options.autoRouteDNATBypassMark(), b.options.autoRouteDNATBypassMask()
+	dnsMark, dnsMask := b.options.translatedDNSRoutingMark()
+	base := uint32(DefaultAutoRedirectInputMark & autoRouteDNATBypassMarkFieldMask)
+	for _, candidate := range []uint32{
+		base,
+		base ^ 1,
+		base ^ 2,
+		base ^ 3,
+		base ^ (bypassMask & -bypassMask),
+	} {
+		if candidate != 0 && candidate&bypassMask != bypassMark && candidate&dnsMask != dnsMark {
+			return candidate
+		}
 	}
-	return mark
+	for candidate := uint32(1); candidate <= autoRouteDNATBypassMarkFieldMask; candidate++ {
+		if candidate&bypassMask != bypassMark && candidate&dnsMask != dnsMark {
+			return candidate
+		}
+	}
+	return base
 }
 
 func (b *autoRouteDNATBypass) serviceConnmarkMask(mark uint32) uint32 {
@@ -259,6 +274,22 @@ func (b *autoRouteDNATBypass) replaceNFTServiceForward(i int, scope serviceForwa
 		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{byte(family)}},
 		&expr.Verdict{Kind: expr.VerdictReturn},
 	}})
+	if i == 0 && scope.calicoWorkloads {
+		// Reverse-path validation of a TUN reply can look up the original
+		// flow on the workload interface, where a mark of zero denotes a BPF probe.
+		mark := b.forwardedInputMark()
+		reply := []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: nftablesIfname(b.options.Name)},
+			&expr.Ct{Key: expr.CtKeyDIRECTION, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{1}},
+			&expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: length},
+			&expr.Lookup{SourceRegister: 1, SetID: set.ID, SetName: set.Name},
+			&expr.Ct{Key: expr.CtKeyMARK, Register: 1},
+			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: binaryutil.NativeEndian.PutUint32(b.serviceConnmarkMask(mark)), Xor: make([]byte, 4)},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(mark)},
+		}
+		reply = appendServiceMarkMatch(reply, ^uint32(0), 0)
+		conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: appendRouteMark(reply, ^uint32(0), mark)})
+	}
 	mask := b.options.autoRouteDNATBypassMask()
 	for _, proto := range []byte{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
 		transport := []expr.Any{&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}}}
@@ -441,6 +472,11 @@ func (b *autoRouteDNATBypass) replaceIPTablesServiceForward(i int, scope service
 			}
 		}
 		if scope.calicoWorkloads {
+			if i == 0 {
+				mark := b.forwardedInputMark()
+				fmt.Fprintf(&buf, "-A %s -i %s -m conntrack --ctdir REPLY --ctorigsrc %s -m connmark --mark %#x/%#x -m mark --mark 0 -j MARK --set-mark %#x\n",
+					chain, strconv.Quote(b.options.Name), addr, mark, b.serviceConnmarkMask(mark), mark)
+			}
 			for _, up := range scope.uplinks {
 				fmt.Fprintf(&buf, "-A %s -i %s -d %s -m mark --mark 0 -j MARK --set-mark %#x\n", chain, strconv.Quote(up), addr, b.forwardedInputMark())
 			}

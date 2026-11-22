@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metacubex/nftables"
 	"github.com/metacubex/sing/common/logger"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -69,15 +70,18 @@ func TestAutoRoutePreservesForwardedServiceReply(t *testing.T) {
 			require.NoError(t, err)
 		}
 	}
-	if os.Getenv("SING_TUN_INTEGRATION") != "1" {
-		t.Skip("requires a private Linux network namespace, iproute2 and socat")
-	}
 	for _, backend := range []string{"cali-backend", "cilium_host"} {
-		t.Run(backend, func(t *testing.T) { checkForwardedService(t, backend, 0, "") })
+		t.Run(backend, func(t *testing.T) {
+			runCalicoIntegration(t, func() { checkForwardedService(t, backend, 0, "") })
+		})
 	}
-	t.Run("cilium_host_high_output_mark", func(t *testing.T) { checkForwardedService(t, "cilium_host", 0x10000, "") })
+	t.Run("cilium_host_high_output_mark", func(t *testing.T) {
+		runCalicoIntegration(t, func() { checkForwardedService(t, "cilium_host", 0x10000, "") })
+	})
 	for _, mode := range []string{"dnat", "preexisting-connmark", "ecmp"} {
-		t.Run(mode, func(t *testing.T) { checkForwardedService(t, "cilium_host", 0, mode) })
+		t.Run(mode, func(t *testing.T) {
+			runCalicoIntegration(t, func() { checkForwardedService(t, "cilium_host", 0, mode) })
+		})
 	}
 }
 
@@ -162,8 +166,11 @@ func checkForwardedService(t *testing.T, backend string, outputMark uint32, mode
 	require.Equal(t, "before", echo("before"))
 	n := startTestAutoRoute(t, outputMark)
 	require.NotNil(t, n.dnatBypass)
-	listing, err := exec.Command("nft", "list", "table", "inet", n.dnatBypass.tableName).CombinedOutput()
-	require.NoError(t, err, string(listing))
+	nft, err := nftables.New()
+	require.NoError(t, err)
+	defer nft.CloseLasting()
+	_, err = nft.ListTableOfFamily(n.dnatBypass.tableName, nftables.TableFamilyINet)
+	require.NoError(t, err)
 	checkTraffic := func() {
 		if backend == "cali-backend" {
 			for _, port := range []string{"53", "18888"} {
