@@ -5,6 +5,7 @@ package tun
 import (
 	"bufio"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metacubex/sing/common/logger"
+	"github.com/sagernet/netlink"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -373,6 +376,19 @@ s.sendto(b"external-dns-query", ("203.0.113.7", 53))
 	readCalicoTestTUN(t, n, "external-dns-query")
 }
 
+func TestDNSHijackIgnoresZeroValueRules(t *testing.T) {
+	r := &autoRedirect{
+		iptablesPath: "/usr/sbin/iptables",
+		tunOptions: &Options{
+			Name:      "tun0",
+			DNSHijack: []DNSHijackRule{{}},
+		},
+	}
+	rules, err := r.iptablesDNSHijackRules(r.iptablesPath, nil, nil)
+	require.NoError(t, err)
+	require.Empty(t, rules)
+}
+
 func TestSrcValidMarkPreservesOtherOwnerOnWriteFailure(t *testing.T) {
 	runCalicoIntegration(t, func() {
 		conf := createIPv4Conf(t, "0", "0", "1")
@@ -397,6 +413,120 @@ func TestSrcValidMarkPreservesOtherOwnerOnWriteFailure(t *testing.T) {
 		value, err := os.ReadFile(path)
 		require.NoError(t, err)
 		require.Equal(t, "0", strings.TrimSpace(string(value)))
+	})
+}
+
+type errorRecorder struct {
+	logger.Logger
+	errors []string
+}
+
+func (r *errorRecorder) Error(args ...any) {
+	r.errors = append(r.errors, fmt.Sprint(args...))
+}
+
+func TestAutoRouteSurvivesResolverWriteRefusal(t *testing.T) {
+	runCalicoIntegration(t, func() {
+		setupForwardingPeers(t, "backend0")
+		runTestIP(t, "route", "add", "default", "via", "192.0.2.2", "dev", "edge0")
+
+		dir := t.TempDir()
+		logPath := filepath.Join(dir, "resolvectl.log")
+		t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+		t.Setenv("COMMAND_LOG", logPath)
+		script := "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$COMMAND_LOG\"\nif [ \"$1\" = \"default-route\" ]; then\n  echo 'Link DNS configuration refused' >&2\n  exit 1\nfi\nexit 0\n"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "resolvectl"), []byte(script), 0o700))
+
+		rec := &errorRecorder{Logger: logger.NOP()}
+		device, err := New(Options{
+			Name:               "review-tun",
+			MTU:                1500,
+			Inet4Address:       []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
+			Inet4RouteAddress:  []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+			AutoRoute:          true,
+			IPRoute2TableIndex: 19221,
+			IPRoute2RuleIndex:  19220,
+			Logger:             rec,
+		})
+		require.NoError(t, err)
+		n := device.(*NativeTun)
+		t.Cleanup(func() { _ = n.Close() })
+
+		require.Empty(t, n.resolvedDNSPath, "partial resolver write must be reverted")
+		require.NotEmpty(t, rec.errors, "resolver write refusal must be logged")
+		logData, err := os.ReadFile(logPath)
+		require.NoError(t, err)
+		require.Equal(t, "status\ndomain\ndefault-route\nrevert\n", string(logData))
+
+		// Ordinary UDP traffic must still enter TUN.
+		out, err := exec.Command("ip", "netns", "exec", "backend", "python3", "-c",
+			`import socket; s=socket.socket(type=socket.SOCK_DGRAM); s.bind(("10.85.1.27",0)); s.sendto(b"resolver-refusal-udp",("203.0.113.7",18889))`).CombinedOutput()
+		require.NoError(t, err, string(out))
+		readCalicoTestTUN(t, n, "resolver-refusal-udp")
+	})
+}
+
+func TestAutoRouteRejectsResolverRollbackFailure(t *testing.T) {
+	runCalicoIntegration(t, func() {
+		dir := t.TempDir()
+		t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+		script := `#!/bin/sh
+case "$1" in
+status|domain) exit 0 ;;
+default-route) echo 'Link DNS configuration refused' >&2 ;;
+revert) echo 'Link DNS rollback refused' >&2 ;;
+esac
+exit 1
+`
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "resolvectl"), []byte(script), 0o700))
+		rules := runTestIP(t, "-4", "rule", "show")
+		routes := runTestIP(t, "-4", "route", "show", "table", "all")
+
+		device, err := New(Options{
+			Name:               "review-tun",
+			MTU:                1500,
+			Inet4Address:       []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
+			Inet4RouteAddress:  []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+			AutoRoute:          true,
+			IPRoute2TableIndex: 19221,
+			IPRoute2RuleIndex:  19220,
+			Logger:             logger.NOP(),
+		})
+		if device != nil {
+			t.Cleanup(func() { _ = device.Close() })
+		}
+		require.ErrorContains(t, err, "Link DNS configuration refused", "failed resolver rollback must abort TUN startup")
+		require.ErrorContains(t, err, "Link DNS rollback refused")
+		require.Nil(t, device)
+		_, linkErr := netlink.LinkByName("review-tun")
+		require.Error(t, linkErr, "failed startup must remove the TUN link")
+		require.Equal(t, rules, runTestIP(t, "-4", "rule", "show"))
+		require.Equal(t, routes, runTestIP(t, "-4", "route", "show", "table", "all"))
+		tables, err := exec.Command("nft", "list", "tables").CombinedOutput()
+		require.NoError(t, err, string(tables))
+		require.NotContains(t, string(tables), "sing-tun-route-19221")
+	})
+}
+
+func TestAutoRouteRejectsInvalidDNSConfigWithResolver(t *testing.T) {
+	runCalicoIntegration(t, func() {
+		dir := t.TempDir()
+		t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "resolvectl"), []byte("#!/bin/sh\nexit 0\n"), 0o700))
+
+		_, err := New(Options{
+			Name:               "bad-dns-tun",
+			MTU:                1500,
+			Inet4Address:       []netip.Prefix{netip.MustParsePrefix("198.18.0.1/32")},
+			Inet4RouteAddress:  []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+			AutoRoute:          true,
+			IPRoute2TableIndex: 19231,
+			IPRoute2RuleIndex:  19230,
+			Logger:             logger.NOP(),
+		})
+		require.Error(t, err, "invalid DNS configuration must still abort TUN startup")
+		_, linkErr := netlink.LinkByName("bad-dns-tun")
+		require.Error(t, linkErr, "failed startup must not leave the TUN link behind")
 	})
 }
 

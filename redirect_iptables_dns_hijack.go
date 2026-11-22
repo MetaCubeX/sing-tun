@@ -25,7 +25,7 @@ func (r *autoRedirect) iptablesDNSHijackRules(path string, routeAddress []netip.
 	var commands []string
 	for _, rule := range rules {
 		address := rule.Address.Addr()
-		if address.Zone() != "" || rule.Network == "tcp" || !address.IsUnspecified() && address.Is4() != (path == r.iptablesPath) {
+		if !address.IsValid() || rule.Address.Port() == 0 || address.Zone() != "" || rule.Network == "tcp" || !address.IsUnspecified() && address.Is4() != (path == r.iptablesPath) {
 			continue
 		}
 		var selectors []string

@@ -250,7 +250,7 @@ func (b *autoRouteDNATBypass) setupNFTablesDNS(family nftables.TableFamily, addr
 			selector = append(selector, nftablesDNATStatusExpressions()...)
 		}
 		for _, frontend := range b.dnsFrontends(family == nftables.TableFamilyIPv6, proto, beforeNAT) {
-			match := append(selector, &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1,
+			match := append(slices.Clone(selector), &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1,
 				Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(frontend.Port())})
 			if addr := frontend.Addr(); !addr.IsUnspecified() {
@@ -261,7 +261,7 @@ func (b *autoRouteDNATBypass) setupNFTablesDNS(family nftables.TableFamily, addr
 			}
 			for _, address := range addresses {
 				src := address.Addr().AsSlice()
-				local := append(match, &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: sourceOffset, Len: uint32(len(src))},
+				local := append(slices.Clone(match), &expr.Payload{OperationType: expr.PayloadLoad, DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: sourceOffset, Len: uint32(len(src))},
 					&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: src})
 				nft.AddRule(&nftables.Rule{Table: table, Chain: output, Exprs: appendRouteMark(local, mask, mark)})
 			}

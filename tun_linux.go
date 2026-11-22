@@ -436,7 +436,14 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	if t.options.DNSModeOrDefault() != DNSModeDisabled {
 		err = t.setSearchDomainForSystemdResolved()
 		if err != nil {
-			return E.Errors(E.Cause(err, "set search domain"), t.rollbackAutoRoute(tunLink))
+			var writeErr resolvedDNSWriteError
+			if errors.As(err, &writeErr) {
+				if t.options.Logger != nil {
+					t.options.Logger.Error(E.Cause(err, "set search domain"))
+				}
+			} else {
+				return E.Errors(E.Cause(err, "set search domain"), t.rollbackAutoRoute(tunLink))
+			}
 		}
 	}
 	if t.ipvsDNSBypass != nil {
@@ -1173,6 +1180,18 @@ func (t *NativeTun) routeUpdate(_ *control.Interface, flags int) {
 	}
 }
 
+type resolvedDNSWriteError struct {
+	err error
+}
+
+func (e resolvedDNSWriteError) Error() string {
+	return e.err.Error()
+}
+
+func (e resolvedDNSWriteError) Unwrap() error {
+	return e.err
+}
+
 func (t *NativeTun) setSearchDomainForSystemdResolved() error {
 	ctlPath, err := exec.LookPath("resolvectl")
 	if err != nil {
@@ -1193,8 +1212,11 @@ func (t *NativeTun) setSearchDomainForSystemdResolved() error {
 	for _, args := range commands {
 		output, err := shell.Exec(ctlPath, args...).Read()
 		if err != nil {
-			return E.Errors(E.Extend(E.Cause(err, "set DNS configuration for interface: ", t.options.Name), output),
-				t.unsetSearchDomainForSystemdResolved())
+			writeErr := E.Extend(E.Cause(err, "set DNS configuration for interface: ", t.options.Name), output)
+			if revertErr := t.unsetSearchDomainForSystemdResolved(); revertErr != nil {
+				return E.Errors(writeErr, revertErr)
+			}
+			return resolvedDNSWriteError{err: writeErr}
 		}
 		t.resolvedDNSPath = ctlPath
 	}

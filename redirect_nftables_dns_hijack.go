@@ -23,7 +23,7 @@ func (r *autoRedirect) nftablesCreateConfiguredDNSHijackRules(nft *nftables.Conn
 		}
 		for _, destination := range r.tunOptions.DNSHijack {
 			address := destination.Address.Addr()
-			if address.Zone() != "" {
+			if !address.IsValid() || destination.Address.Port() == 0 || address.Zone() != "" {
 				continue
 			}
 			if !address.IsUnspecified() && address.Is4() != (family == nftables.TableFamilyIPv4) {
