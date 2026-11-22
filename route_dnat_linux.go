@@ -501,24 +501,109 @@ func (b *autoRouteDNATBypass) cleanupNFTablesBase() error {
 		deleteRouteNFTTable(nftables.TableFamilyIPv6, b.tableName+"-dnat"))
 }
 
-func (b *autoRouteDNATBypass) cleanupStaleIPTables() error {
-	var err error
-	for _, active := range []string{b.iptablesPath, b.ip6tablesPath} {
-		if active != "" {
-			err = errors.Join(err, cleanupIPTablesChain(active, "raw", "OUTPUT", b.chainName))
+type iptablesChainRef struct {
+	hook  string
+	chain string
+}
+
+func (b *autoRouteDNATBypass) mangleChains() []iptablesChainRef {
+	return []iptablesChainRef{
+		{hook: "PREROUTING", chain: b.chainName},
+		{hook: "OUTPUT", chain: b.ipvsOutputChain()},
+		{hook: "PREROUTING", chain: b.ipvsReplyChain()},
+		{hook: "PREROUTING", chain: b.chainName + "-FWD"},
+		{hook: "", chain: b.chainName + "-QUEUE"},
+		{hook: "INPUT", chain: b.chainName + "-INPUT"},
+		{hook: "FORWARD", chain: b.chainName + "-FORWARD"},
+		{hook: "POSTROUTING", chain: b.chainName + "-POST"},
+	}
+}
+
+func legacyIPTablesHasTable(ipv6 bool, table string) bool {
+	procPath := "/proc/net/ip_tables_names"
+	if ipv6 {
+		procPath = "/proc/net/ip6_tables_names"
+	}
+	data, err := os.ReadFile(procPath)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == table {
+			return true
 		}
 	}
-	for _, tool := range []string{"iptables", "ip6tables"} {
+	return false
+}
+
+func nftablesHasXTables(family nftables.TableFamily) (mangle, raw bool, ok bool) {
+	nft, err := nftables.New()
+	if err != nil {
+		return false, false, false
+	}
+	defer nft.CloseLasting()
+	tables, err := nft.ListTablesOfFamily(family)
+	if err != nil {
+		return false, false, false
+	}
+	for _, table := range tables {
+		switch table.Name {
+		case "mangle":
+			mangle = true
+		case "raw":
+			raw = true
+		}
+	}
+	return mangle, raw, true
+}
+
+func (b *autoRouteDNATBypass) cleanupStaleIPTables() error {
+	var err error
+	for i, active := range []string{b.iptablesPath, b.ip6tablesPath} {
+		if active == "" {
+			continue
+		}
+		if strings.HasSuffix(active, "-legacy") && !legacyIPTablesHasTable(i == 1, "raw") {
+			continue
+		}
+		err = errors.Join(err, cleanupIPTablesChain(active, "raw", "OUTPUT", b.chainName))
+	}
+	for i, tool := range []string{"iptables", "ip6tables"} {
+		ipv6 := i == 1
+		family := nftables.TableFamilyIPv4
+		if ipv6 {
+			family = nftables.TableFamilyIPv6
+		}
+		probedExplicit := false
 		for _, backend := range []string{"-legacy", "-nft", ""} {
+			if backend == "" && probedExplicit {
+				break
+			}
 			path, lookupErr := exec.LookPath(tool + backend)
-			if lookupErr != nil || path == b.iptablesPath || path == b.ip6tablesPath {
+			if lookupErr != nil {
 				continue
 			}
-			err = errors.Join(err, b.cleanupIPTablesPath(path), cleanupIPTablesChain(path, "raw", "OUTPUT", b.chainName))
-			// The unsuffixed command is an alternative for one of the
-			// explicit frontends, so probing it again is unnecessary.
-			if backend == "-nft" {
-				break
+			if backend != "" {
+				probedExplicit = true
+			}
+			if path == b.iptablesPath || path == b.ip6tablesPath {
+				continue
+			}
+			checkMangle, checkRaw := true, true
+			switch backend {
+			case "-legacy":
+				checkMangle = legacyIPTablesHasTable(ipv6, "mangle")
+				checkRaw = legacyIPTablesHasTable(ipv6, "raw")
+			case "-nft":
+				if hasMangle, hasRaw, ok := nftablesHasXTables(family); ok {
+					checkMangle, checkRaw = hasMangle, hasRaw
+				}
+			}
+			if checkMangle {
+				err = errors.Join(err, b.cleanupIPTablesPath(path))
+			}
+			if checkRaw {
+				err = errors.Join(err, cleanupIPTablesChain(path, "raw", "OUTPUT", b.chainName))
 			}
 		}
 	}
@@ -536,42 +621,71 @@ func (b *autoRouteDNATBypass) cleanupIPTables() error {
 }
 
 func (b *autoRouteDNATBypass) cleanupIPTablesPath(path string) error {
-	return errors.Join(cleanupIPTablesChain(path, "mangle", "PREROUTING", b.chainName),
-		cleanupIPTablesChain(path, "mangle", "OUTPUT", b.ipvsOutputChain()),
-		cleanupIPTablesChain(path, "mangle", "PREROUTING", b.ipvsReplyChain()), b.cleanupIPTablesServiceForward(path))
-}
-
-func (b *autoRouteDNATBypass) cleanupIPTablesServiceForward(path string) error {
-	return errors.Join(cleanupIPTablesChain(path, "mangle", "PREROUTING", b.chainName+"-FWD"),
-		cleanupIPTablesChain(path, "mangle", "", b.chainName+"-QUEUE"),
-		cleanupIPTablesChain(path, "mangle", "INPUT", b.chainName+"-INPUT"),
-		cleanupIPTablesChain(path, "mangle", "FORWARD", b.chainName+"-FORWARD"),
-		cleanupIPTablesChain(path, "mangle", "POSTROUTING", b.chainName+"-POST"))
+	return cleanupIPTablesTable(path, "mangle", b.mangleChains())
 }
 
 func cleanupIPTablesChain(path, table, hook, chain string) error {
+	return cleanupIPTablesTable(path, table, []iptablesChainRef{{hook: hook, chain: chain}})
+}
+
+func cleanupIPTablesTable(path, table string, targets []iptablesChainRef) error {
 	list, err := outputIPTables(path, "-t", table, "-S")
 	if err != nil {
 		return err
 	}
-	chainExists := false
+	targetIndex := make(map[string]int, len(targets))
+	for i, target := range targets {
+		targetIndex[target.chain] = i
+	}
+	exists := make([]bool, len(targets))
+	var deleteJumps []string
 	for _, line := range strings.Split(string(list), "\n") {
-		switch line {
-		case "-N " + chain:
-			chainExists = true
-		case "-A " + hook + " -j " + chain:
-			if err := runIPTables(path, "-t", table, "-D", hook, "-j", chain); err != nil {
-				return err
+		if name, ok := strings.CutPrefix(line, "-N "); ok {
+			if idx, matched := targetIndex[name]; matched {
+				exists[idx] = true
+			}
+			continue
+		}
+		for _, target := range targets {
+			if target.hook != "" && line == "-A "+target.hook+" -j "+target.chain {
+				deleteJumps = append(deleteJumps, fmt.Sprintf("-D %s -j %s", target.hook, target.chain))
+				break
 			}
 		}
 	}
-	if !chainExists {
+	anyExists := false
+	for _, found := range exists {
+		if found {
+			anyExists = true
+			break
+		}
+	}
+	if !anyExists && len(deleteJumps) == 0 {
 		return nil
 	}
-	if err := runIPTables(path, "-t", table, "-F", chain); err != nil {
-		return err
+	var script strings.Builder
+	fmt.Fprintf(&script, "*%s\n", table)
+	for _, rule := range deleteJumps {
+		script.WriteString(rule)
+		script.WriteByte('\n')
 	}
-	return runIPTables(path, "-t", table, "-X", chain)
+	for i, target := range targets {
+		if exists[i] {
+			fmt.Fprintf(&script, "-F %s\n", target.chain)
+		}
+	}
+	for i, target := range targets {
+		if exists[i] {
+			fmt.Fprintf(&script, "-X %s\n", target.chain)
+		}
+	}
+	script.WriteString("COMMIT\n")
+	cmd := exec.Command(path+"-restore", "--wait", "5", "--noflush")
+	cmd.Stdin = strings.NewReader(script.String())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return E.Extend(err, fmt.Sprintf("%s-restore -t %s: %s", path, table, output))
+	}
+	return nil
 }
 
 func outputIPTables(path string, args ...string) ([]byte, error) {

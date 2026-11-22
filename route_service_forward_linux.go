@@ -236,6 +236,7 @@ func (b *autoRouteDNATBypass) replaceNFTServiceForward(i int, scope serviceForwa
 	} else {
 		conn.FlushChain(chain)
 		if b.forwardScopes[i].calicoWorkloads && !scope.calicoWorkloads {
+			conn.FlushChain(queue)
 			conn.DelChain(queue)
 		}
 		if len(elems) == 0 {
