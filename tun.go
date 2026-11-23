@@ -140,7 +140,9 @@ type Options struct {
 	// For wintun
 	//
 	// The GUID of the adapter, as in "00000000-0000-0000-0000-000000000000";
-	// empty means one derived from the name.
+	// empty means one derived from the name. It is used when the adapter is
+	// created: one that already has the name is opened as it is and keeps its
+	// own GUID.
 	WintunGUID string
 }
 
