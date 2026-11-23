@@ -127,22 +127,7 @@ func nftablesCreateIPConst(
 	return mySet, nil
 }
 
-func nftablesCreateIPSet(
-	nft *nftables.Conn, table *nftables.Table,
-	id uint32, name string, family nftables.TableFamily,
-	setList []*netipx.IPSet, prefixList []netip.Prefix, appendDefault bool, update bool,
-) (*nftables.Set, error) {
-	var builder netipx.IPSetBuilder
-	for _, prefix := range prefixList {
-		builder.AddPrefix(prefix)
-	}
-	for _, set := range setList {
-		builder.AddSet(set)
-	}
-	ipSet, err := builder.IPSet()
-	if err != nil {
-		return nil, err
-	}
+func nftablesIntervalElements(ipSet *netipx.IPSet, family nftables.TableFamily) []nftables.SetElement {
 	ipRanges := ipSet.Ranges()
 	setElements := make([]nftables.SetElement, 0, len(ipRanges))
 	for _, rr := range ipRanges {
@@ -166,6 +151,26 @@ func nftablesCreateIPSet(
 			})
 		}
 	}
+	return setElements
+}
+
+func nftablesCreateIPSet(
+	nft *nftables.Conn, table *nftables.Table,
+	id uint32, name string, family nftables.TableFamily,
+	setList []*netipx.IPSet, prefixList []netip.Prefix, appendDefault bool, update bool,
+) (*nftables.Set, error) {
+	var builder netipx.IPSetBuilder
+	for _, prefix := range prefixList {
+		builder.AddPrefix(prefix)
+	}
+	for _, set := range setList {
+		builder.AddSet(set)
+	}
+	ipSet, err := builder.IPSet()
+	if err != nil {
+		return nil, err
+	}
+	setElements := nftablesIntervalElements(ipSet, family)
 	if appendDefault && len(setElements) == 0 {
 		if family == nftables.TableFamilyIPv4 {
 			setElements = append(setElements, nftables.SetElement{

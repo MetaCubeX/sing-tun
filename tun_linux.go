@@ -32,7 +32,14 @@ type NativeTun struct {
 	tunFd             int
 	tunFile           *os.File
 	interfaceCallback *list.Element[DefaultInterfaceUpdateCallback]
+	resolvedDNSPath   string
 	options           Options
+	routeAccess       sync.Mutex
+	dnatBypass        *autoRouteDNATBypass
+	ipvsDNSBypass     *autoRouteIPVSDNSBypass
+	serviceRoutes     [2]map[serviceRoute]bool
+	forwardPriority   [2]int
+	ipvsDNSPending    map[ipvsDNSDestination]bool
 	ruleIndex6        []int
 	readAccess        sync.Mutex
 	writeAccess       sync.Mutex
@@ -47,6 +54,15 @@ type NativeTun struct {
 }
 
 func New(options Options) (Tun, error) {
+	if options.AutoRoute && options.AutoRedirectMarkMode {
+		outputMark := options.AutoRedirectOutputMark
+		if outputMark == 0 {
+			outputMark = DefaultAutoRedirectOutputMark
+		}
+		if options.AutoRedirectInputMark == outputMark {
+			return nil, E.New("auto redirect input and output marks must be different")
+		}
+	}
 	var nativeTun *NativeTun
 	if options.FileDescriptor == 0 {
 		tunFd, err := open(options.Name, options.GSO)
@@ -64,7 +80,7 @@ func New(options Options) (Tun, error) {
 		}
 		err = nativeTun.configure(tunLink)
 		if err != nil {
-			return nil, E.Errors(err, unix.Close(tunFd))
+			return nil, E.Errors(err, nativeTun.tunFile.Close())
 		}
 	} else {
 		nativeTun = &NativeTun{
@@ -390,33 +406,77 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 		}
 	}
 
+	if t.options.AutoRoute && runtime.GOOS != "android" {
+		t.enableAutoRouteDNATBypass(prepareAutoRouteDNATBypass)
+		if !t.options.AutoRedirectMarkMode || t.dnatBypass != nil {
+			t.enableAutoRouteIPVSDNSBypass(ipvsTablePath)
+		}
+	}
+
 	err = t.setRoute(tunLink)
 	if err != nil {
 		_ = t.unsetRoute0(tunLink)
-		return err
+		return E.Errors(err, common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
 
 	err = t.unsetRules()
 	if err != nil {
-		return E.Cause(err, "cleanup rules")
+		return E.Errors(E.Cause(err, "cleanup rules"), t.unsetRoute0(tunLink), common.Close(common.PtrOrNil(t.dnatBypass)))
 	}
-	err = t.setRules()
+	if t.dnatBypass != nil {
+		// Install the local DNS lookups before the general DNAT bypass at
+		// the same priority. Forwarded port replies keep the general rule.
+		t.dnatBypass.startDNS()
+	}
+	err = setRules(t.rules())
 	if err != nil {
-		_ = t.unsetRules()
-		return err
+		return E.Errors(err, t.rollbackAutoRoute(tunLink))
 	}
 
 	if t.options.DNSModeOrDefault() != DNSModeDisabled {
 		err = t.setSearchDomainForSystemdResolved()
 		if err != nil {
-			return E.Cause(err, "set search domain")
+			var writeErr resolvedDNSWriteError
+			if errors.As(err, &writeErr) {
+				if t.options.Logger != nil {
+					t.options.Logger.Error(E.Cause(err, "set search domain"))
+				}
+			} else {
+				return E.Errors(E.Cause(err, "set search domain"), t.rollbackAutoRoute(tunLink))
+			}
 		}
+	}
+	if t.ipvsDNSBypass != nil {
+		t.refreshIPVSDNSBypass()
+		if err = t.ipvsDNSBypass.Start(t.refreshIPVSDNSBypass); err != nil {
+			return E.Errors(err, t.rollbackAutoRoute(tunLink))
+		}
+		// Cover changes between the initial snapshot and event subscription.
+		t.refreshIPVSDNSBypass()
 	}
 
 	if t.options.AutoRoute && runtime.GOOS == "android" {
 		t.interfaceCallback = t.options.InterfaceMonitor.RegisterCallback(t.routeUpdate)
 	}
 	return nil
+}
+
+func (t *NativeTun) rollbackAutoRoute(tunLink netlink.Link) error {
+	return E.Errors(t.unsetSearchDomainForSystemdResolved(), t.removeCalicoProbeRules(), common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute0(tunLink))
+}
+
+func (t *NativeTun) removeCalicoProbeRules() error {
+	return errors.Join(t.removeCalicoFamilyProbeRules(0), t.removeCalicoFamilyProbeRules(1))
+}
+
+func (t *NativeTun) removeCalicoFamilyProbeRules(i int) error {
+	var err error
+	for path := range t.serviceRoutes[i] {
+		if path.isCalicoProbe() {
+			err = errors.Join(err, t.removeServiceRoute(path))
+		}
+	}
+	return err
 }
 
 func (t *NativeTun) enableGSO() error {
@@ -443,14 +503,17 @@ func (t *NativeTun) enableGSO() error {
 }
 
 func (t *NativeTun) Close() error {
+	if t.ipvsDNSBypass != nil {
+		t.ipvsDNSBypass.Close()
+	}
 	if t.interfaceCallback != nil {
 		t.options.InterfaceMonitor.UnregisterCallback(t.interfaceCallback)
 	}
-	if t.options.DNSModeOrDefault() != DNSModeDisabled {
-		t.unsetSearchDomainForSystemdResolved()
-	}
+	t.routeAccess.Lock()
+	defer t.routeAccess.Unlock()
+	err := E.Errors(t.unsetSearchDomainForSystemdResolved(), t.removeCalicoProbeRules())
 	t.unsetAddresses()
-	return E.Errors(t.unsetRoute(), t.unsetRules(), common.Close(common.PtrOrNil(t.tunFile)))
+	return E.Errors(err, common.Close(common.PtrOrNil(t.dnatBypass)), t.unsetRules(), t.unsetRoute(), common.Close(common.PtrOrNil(t.tunFile)))
 }
 
 func (t *NativeTun) TXChecksumOffload() bool {
@@ -534,6 +597,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	var it *netlink.Rule
 
 	excludeRanges := t.options.ExcludedRanges()
+	dnatBypassMarkMask := int(t.options.autoRouteDNATBypassMask())
 
 	ruleStart := t.options.IPRoute2RuleIndex
 	priority := ruleStart
@@ -544,6 +608,10 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it = netlink.NewRule()
 			it.Priority = priority
 			it.Mark = t.options.AutoRedirectOutputMark
+			if t.dnatBypass != nil {
+				it.Mark = t.options.autoRouteDNATBypassMark()
+				it.Mask = dnatBypassMarkMask
+			}
 			it.MarkSet = true
 			it.Goto = priority + 2
 			it.Family = unix.AF_INET
@@ -568,6 +636,10 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it = netlink.NewRule()
 			it.Priority = priority6
 			it.Mark = t.options.AutoRedirectOutputMark
+			if t.dnatBypass != nil {
+				it.Mark = t.options.autoRouteDNATBypassMark()
+				it.Mask = dnatBypassMarkMask
+			}
 			it.MarkSet = true
 			it.Goto = priority6 + 2
 			it.Family = unix.AF_INET6
@@ -608,6 +680,55 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	}
 
 	nopPriority := ruleStart + 10
+	if t.dnatBypass != nil {
+		if p4 {
+			it = netlink.NewRule()
+			it.Priority = priority
+			it.Mark = t.options.autoRouteDNATBypassMark()
+			it.Mask = dnatBypassMarkMask
+			it.MarkSet = true
+			it.Goto = nopPriority
+			it.Family = unix.AF_INET
+			rules = append(rules, it)
+			rules = append(rules, t.translatedDNSLookupRule(unix.AF_INET, priority))
+			// Source validation swaps the ports. If the lookup still
+			// targets port 53, resume the ordinary routing policy
+			// before the reverse lookup can use the system default.
+			forward := t.translatedDNSLookupRule(unix.AF_INET, priority)
+			forward.Table = -1
+			forward.SuppressPrefixlen = -1
+			forward.Goto = priority + 1
+			reverse := t.translatedDNSLookupRule(unix.AF_INET, priority)
+			reverse.Sport, reverse.Dport = reverse.Dport, nil
+			reverse.SuppressPrefixlen = -1
+			rules = append(rules, forward, reverse)
+			priority++
+		}
+		if p6 {
+			it = netlink.NewRule()
+			it.Priority = priority6
+			it.Mark = t.options.autoRouteDNATBypassMark()
+			it.Mask = dnatBypassMarkMask
+			it.MarkSet = true
+			it.Goto = nopPriority
+			it.Family = unix.AF_INET6
+			rules = append(rules, it)
+			rules = append(rules, t.translatedDNSLookupRule(unix.AF_INET6, priority6))
+			priority6++
+		}
+	}
+	if t.ipvsDNSBypass != nil {
+		for _, destination := range t.ipvsDNSBypass.Destinations() {
+			rules = append(rules, t.ipvsDNSRules(destination)...)
+		}
+		// Keep later policy priorities stable while IPVS backends change.
+		if p4 {
+			priority++
+		}
+		if p6 {
+			priority6++
+		}
+	}
 	for _, excludePort := range t.options.ExcludeSrcPort {
 		if p4 {
 			it = netlink.NewRule()
@@ -835,6 +956,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			rules = append(rules, it)
 		}
 	}
+	t.forwardPriority = [2]int{priority, priority6}
 	if p4 {
 		it = netlink.NewRule()
 		it.Priority = priority
@@ -943,9 +1065,9 @@ func (t *NativeTun) setRoute(tunLink netlink.Link) error {
 	return nil
 }
 
-func (t *NativeTun) setRules() error {
-	for i, rule := range t.rules() {
-		err := netlink.RuleAdd(rule)
+func setRules(rules []*netlink.Rule) error {
+	for i, rule := range rules {
+		err := addAutoRouteRule(rule)
 		if err != nil {
 			if rule.Type == unix.FR_ACT_UNREACHABLE && errors.Is(err, unix.EAFNOSUPPORT) {
 				socketFd, socketErr := unix.Socket(rule.Family, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
@@ -955,7 +1077,7 @@ func (t *NativeTun) setRules() error {
 					continue
 				}
 			}
-			return E.Cause(err, "add rule ", i, "/", len(t.rules()))
+			return E.Cause(err, "add rule ", i, "/", len(rules))
 		}
 	}
 	return nil
@@ -1038,14 +1160,18 @@ func (t *NativeTun) unsetAddresses() {
 }
 
 func (t *NativeTun) resetRules() error {
-	t.unsetRules()
-	return t.setRules()
+	if err := t.unsetRules(); err != nil {
+		return err
+	}
+	return setRules(t.rules())
 }
 
 func (t *NativeTun) routeUpdate(_ *control.Interface, flags int) {
 	if flags&FlagAndroidVPNUpdate == 0 {
 		return
 	}
+	t.routeAccess.Lock()
+	defer t.routeAccess.Unlock()
 	err := t.resetRules()
 	if err != nil {
 		if t.options.Logger != nil {
@@ -1054,38 +1180,57 @@ func (t *NativeTun) routeUpdate(_ *control.Interface, flags int) {
 	}
 }
 
+type resolvedDNSWriteError struct {
+	err error
+}
+
+func (e resolvedDNSWriteError) Error() string {
+	return e.err.Error()
+}
+
+func (e resolvedDNSWriteError) Unwrap() error {
+	return e.err
+}
+
 func (t *NativeTun) setSearchDomainForSystemdResolved() error {
 	ctlPath, err := exec.LookPath("resolvectl")
 	if err != nil {
+		return nil
+	}
+	if err = shell.Exec(ctlPath, "status").Run(); err != nil {
 		return nil
 	}
 	dnsServer, err := t.options.DNSServerAddress()
 	if err != nil {
 		return err
 	}
-	go func() {
-		commands := [][]string{
-			{"domain", t.options.Name, "~."},
-			{"default-route", t.options.Name, "true"},
-			append([]string{"dns", t.options.Name}, common.Map(dnsServer, netip.Addr.String)...),
-		}
-		for _, args := range commands {
-			output, err := shell.Exec(ctlPath, args...).Read()
-			if err != nil && t.options.Logger != nil {
-				t.options.Logger.Error(E.Extend(E.Cause(err, "set DNS configuration for interface: ", t.options.Name), output))
+	commands := [][]string{
+		{"domain", t.options.Name, "~."},
+		{"default-route", t.options.Name, "true"},
+		append([]string{"dns", t.options.Name}, common.Map(dnsServer, netip.Addr.String)...),
+	}
+	for _, args := range commands {
+		output, err := shell.Exec(ctlPath, args...).Read()
+		if err != nil {
+			writeErr := E.Extend(E.Cause(err, "set DNS configuration for interface: ", t.options.Name), output)
+			if revertErr := t.unsetSearchDomainForSystemdResolved(); revertErr != nil {
+				return E.Errors(writeErr, revertErr)
 			}
+			return resolvedDNSWriteError{err: writeErr}
 		}
-	}()
+		t.resolvedDNSPath = ctlPath
+	}
 	return nil
 }
 
-func (t *NativeTun) unsetSearchDomainForSystemdResolved() {
-	ctlPath, err := exec.LookPath("resolvectl")
+func (t *NativeTun) unsetSearchDomainForSystemdResolved() error {
+	if t.resolvedDNSPath == "" {
+		return nil
+	}
+	output, err := shell.Exec(t.resolvedDNSPath, "revert", t.options.Name).Read()
 	if err != nil {
-		return
+		return E.Extend(E.Cause(err, "revert DNS configuration for interface: ", t.options.Name), output)
 	}
-	_ = shell.Exec(ctlPath, "revert", t.options.Name).Run()
-	if t.options.Logger != nil {
-		t.options.Logger.Debug("cleaned up DNS configuration for interface: ", t.options.Name)
-	}
+	t.resolvedDNSPath = ""
+	return nil
 }
