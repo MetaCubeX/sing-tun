@@ -187,7 +187,7 @@ type Options struct {
 // Makes fd non-blocking, but does not take ownership of fd, which must remain
 // open for the lifetime of the returned endpoint (until after the endpoint has
 // stopped being using and Wait returns).
-func New(opts *Options) (stack.LinkEndpoint, error) {
+func New(opts *Options) (_ stack.LinkEndpoint, err error) {
 	caps := stack.LinkEndpointCapabilities(0)
 	if opts.RXChecksumOffload {
 		caps |= stack.CapabilityRXChecksumOffload
@@ -241,6 +241,12 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 			e.writevMaxIovs = max
 		}
 	}
+
+	defer func() {
+		if err != nil {
+			e.Close()
+		}
+	}()
 
 	// Create per channel dispatchers.
 	for _, fd := range opts.FDs {
@@ -300,8 +306,11 @@ func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 		for i := range e.inboundDispatchers {
 			e.wg.Add(1)
 			go func(i int) { // S/R-SAFE: See above.
-				e.dispatchLoop(e.inboundDispatchers[i])
+				err := e.dispatchLoop(e.inboundDispatchers[i])
 				e.wg.Done()
+				if e.closed != nil {
+					e.closed(err)
+				}
 			}(i)
 		}
 	}
@@ -600,9 +609,6 @@ func (e *endpoint) dispatchLoop(inboundDispatcher linkDispatcher) tcpip.Error {
 	for {
 		cont, err := inboundDispatcher.dispatch()
 		if err != nil || !cont {
-			if e.closed != nil {
-				e.closed(err)
-			}
 			inboundDispatcher.release()
 			return err
 		}
@@ -628,7 +634,13 @@ func (e *endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // Close implements stack.LinkEndpoint.
-func (e *endpoint) Close() {}
+func (e *endpoint) Close() {
+	e.Attach(nil)
+	e.Wait()
+	for _, dispatcher := range e.inboundDispatchers {
+		dispatcher.release()
+	}
+}
 
 // SetOnCloseAction implements stack.LinkEndpoint.
 func (*endpoint) SetOnCloseAction(func()) {}

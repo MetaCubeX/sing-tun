@@ -15,6 +15,8 @@
 package fdbased
 
 import (
+	"sync"
+
 	"github.com/metacubex/gvisor/pkg/buffer"
 	"github.com/metacubex/gvisor/pkg/tcpip"
 	"github.com/metacubex/gvisor/pkg/tcpip/stack"
@@ -84,7 +86,8 @@ func (b *iovecBuffer) release() {
 //
 // +stateify savable
 type readVDispatcher struct {
-	stopfd.StopFD
+	*stopfd.StopFD
+	releaseOnce sync.Once
 	// fd is the file descriptor used to send and receive packets.
 	fd int
 
@@ -115,8 +118,11 @@ func newReadVDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, err
 }
 
 func (d *readVDispatcher) release() {
-	d.buf.release()
-	d.mgr.close()
+	d.releaseOnce.Do(func() {
+		d.buf.release()
+		d.mgr.close()
+		_ = d.StopFD.Close()
+	})
 }
 
 // dispatch reads one packet from the file descriptor and dispatches it.
@@ -148,7 +154,8 @@ func (d *readVDispatcher) dispatch() (bool, tcpip.Error) {
 //
 // +stateify savable
 type recvMMsgDispatcher struct {
-	stopfd.StopFD
+	*stopfd.StopFD
+	releaseOnce sync.Once
 	// fd is the file descriptor used to send and receive packets.
 	fd int
 
@@ -197,10 +204,13 @@ func newRecvMMsgDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, 
 }
 
 func (d *recvMMsgDispatcher) release() {
-	for _, iov := range d.bufs {
-		iov.release()
-	}
-	d.mgr.close()
+	d.releaseOnce.Do(func() {
+		for _, iov := range d.bufs {
+			iov.release()
+		}
+		d.mgr.close()
+		_ = d.StopFD.Close()
+	})
 }
 
 // recvMMsgDispatch reads more than one packet at a time from the file
