@@ -136,6 +136,14 @@ type Options struct {
 
 	// For gvisor
 	EXP_ProcessorsPerChannel int
+
+	// For wintun
+	//
+	// The GUID of the adapter, as in "00000000-0000-0000-0000-000000000000";
+	// empty means one derived from the name. It is used when the adapter is
+	// created: one that already has the name is opened as it is and keeps its
+	// own GUID.
+	WintunGUID string
 }
 
 func (o *Options) DNSModeOrDefault() string {

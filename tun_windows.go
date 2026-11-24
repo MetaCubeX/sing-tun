@@ -2,6 +2,7 @@ package tun
 
 import (
 	"crypto/md5"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -43,7 +44,11 @@ func New(options Options) (WinTun, error) {
 	if options.FileDescriptor != 0 {
 		return nil, os.ErrInvalid
 	}
-	adapter, err := wintun.CreateAdapter(options.Name, TunnelType, generateGUIDByDeviceName(options.Name))
+	requestedGUID, err := adapterGUID(options)
+	if err != nil {
+		return nil, err
+	}
+	adapter, err := wintun.CreateAdapter(options.Name, TunnelType, requestedGUID)
 	if err != nil {
 		if !errors.Is(err, os.ErrExist) {
 			return nil, err
@@ -582,6 +587,26 @@ func (t *NativeTun) Close() error {
 		}
 	})
 	return err
+}
+
+// adapterGUID returns the GUID an adapter created with the given name is to
+// have: the configured one, or else one derived from the name.
+func adapterGUID(options Options) (*windows.GUID, error) {
+	if options.WintunGUID == "" {
+		return generateGUIDByDeviceName(options.Name), nil
+	}
+	raw, err := ParseGUID(options.WintunGUID)
+	if err != nil {
+		return nil, err
+	}
+	// the groups are the field values, big-endian in the canonical bytes; Windows
+	// holds them little-endian in memory, which the fields take care of
+	return &windows.GUID{
+		Data1: binary.BigEndian.Uint32(raw[0:4]),
+		Data2: binary.BigEndian.Uint16(raw[4:6]),
+		Data3: binary.BigEndian.Uint16(raw[6:8]),
+		Data4: [8]byte(raw[8:16]),
+	}, nil
 }
 
 func generateGUIDByDeviceName(name string) *windows.GUID {
