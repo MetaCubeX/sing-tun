@@ -9,6 +9,11 @@ import (
 	E "github.com/metacubex/sing/common/exceptions"
 )
 
+const (
+	tcpNatFirstPort = 10000
+	tcpNatPortCount = 1<<16 - tcpNatFirstPort
+)
+
 type TCPNat struct {
 	timeout    time.Duration
 	portIndex  uint16
@@ -33,7 +38,7 @@ type TCPSession struct {
 func NewNat(ctx context.Context, timeout time.Duration) *TCPNat {
 	natMap := &TCPNat{
 		timeout:   timeout,
-		portIndex: 10000,
+		portIndex: tcpNatFirstPort,
 		addrMap:   make(map[tcpNatKey]uint16),
 		portMap:   make(map[uint16]*TCPSession),
 	}
@@ -147,11 +152,14 @@ func (n *TCPNat) refresh(port uint16) {
 }
 
 func (n *TCPNat) allocatePortLocked() (uint16, bool) {
-	for i := 0; i < 65535-10000+1; i++ {
+	if len(n.portMap) == tcpNatPortCount {
+		return 0, false
+	}
+	for i := 0; i < tcpNatPortCount; i++ {
 		nextPort := n.portIndex
 		if nextPort == 0 {
-			nextPort = 10000
-			n.portIndex = 10001
+			nextPort = tcpNatFirstPort
+			n.portIndex = tcpNatFirstPort + 1
 		} else {
 			n.portIndex++
 		}
